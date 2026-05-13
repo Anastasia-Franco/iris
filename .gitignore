@@ -6,10 +6,17 @@ __pycache__/
 
 # Virtual environments
 venv/
-.env/
+
+# Secrets
+.env
+.env.local
 
 # VS Code
 .vscode/settings.json
+
+# Python tooling
+.pytest_cache/
+.mypy_cache/
 
 # IRIS runtime data
 sessions/
@@ -17,6 +24,12 @@ logs/
 memory/
 vector_db/
 embeddings/
+uploads/
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
 
 # Private documents
 docs/private/
