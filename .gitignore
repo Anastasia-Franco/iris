@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.env/
+
+# VS Code
+.vscode/settings.json
+
+# IRIS runtime data
+sessions/
+logs/
+memory/
+vector_db/
+embeddings/
+
+# Private documents
+docs/private/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Temp files
+*.tmp
+*.bak
