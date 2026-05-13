@@ -92,23 +92,25 @@ Used for:
 - project assistance
 - rapid iteration tasks
 
-### DeepSeek R1 32B / 70B
-High-reasoning models used for advanced workflows.
+### Llama 70B
+Primary high-context reasoning and conversational model.
 
 Used for:
-- architectural reasoning
-- complex synthesis
-- multi-document analysis
-- research workflows
-- long-context tasks
+- advanced reasoning
+- long-form interaction
+- architectural analysis
+- research synthesis
+- multi-document workflows
+
+### DeepSeek R1 Models
+Experimental reasoning models currently used selectively for testing and evaluation workflows.
 
 ### nomic-embed-text
 Embedding and retrieval model.
 
 Used for:
 - context indexing
-- retrieval pipelines
-- semantic search
+- semantic retrieval
 - future vector memory systems
 
 ---
