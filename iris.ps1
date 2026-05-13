@@ -1,0 +1,1 @@
+python "C:\AI\iris\iris.py" @args
