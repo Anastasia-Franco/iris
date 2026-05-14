@@ -1,0 +1,81 @@
+﻿using System;
+using System.Windows.Forms;
+
+namespace WindowsFormsApp
+{
+    public partial class IRIS_UI : Form
+    {
+        public IRIS_UI()
+        {
+            InitializeComponent();
+            cmbMode1.SelectedIndex = 0;
+        }
+
+        private async void BtnSend_Click(object sender, EventArgs e)
+        {
+            string prompt = txtPrompt.Text.Trim();
+
+            if (string.IsNullOrWhiteSpace(prompt))
+                return;
+
+            txtStream.Clear();
+            txtStream.AppendText("You: " + prompt + Environment.NewLine + Environment.NewLine);
+            txtStream.AppendText("IRIS: ");
+
+            btnSend.Enabled = false;
+            string selectedModel = cmbMode1.SelectedItem?.ToString() ?? "qwen3:30b";
+            string escapedPrompt = prompt.Replace("\"", "\\\"");
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "python",
+                Arguments = $"\"C:\\AI\\iris\\iris.py\" --model \"{selectedModel}\" \"{escapedPrompt}\"",
+                StandardOutputEncoding = System.Text.Encoding.UTF8,
+                StandardErrorEncoding = System.Text.Encoding.UTF8,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            var process = new System.Diagnostics.Process
+            {
+                StartInfo = psi,
+                EnableRaisingEvents = true
+            };
+
+            process.OutputDataReceived += (s, args) =>
+            {
+                if (args.Data != null)
+                {
+                    txtStream.Invoke(() =>
+                    {
+                        txtStream.AppendText(args.Data + Environment.NewLine);
+                    });
+                }
+            };
+
+            process.ErrorDataReceived += (s, args) =>
+            {
+                if (args.Data != null)
+                {
+                    txtStream.Invoke(() =>
+                    {
+                        txtStream.AppendText(Environment.NewLine + "[ERR] " + args.Data);
+                    });
+                }
+            };
+
+            process.Start();
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
+
+            await process.WaitForExitAsync();
+
+            btnSend.Enabled = true;
+        }
+
+        private void TxtPrompt_TextChanged(object sender, EventArgs e)
+        {
+        }
+    }
+}

@@ -5,11 +5,13 @@ import requests
 import sys
 import json
 import os
+sys.stdout.reconfigure(encoding='utf-8')
+sys.stderr.reconfigure(encoding='utf-8')
 from dotenv import load_dotenv
 from tavily import TavilyClient
 
 DEFAULT_HOST = "http://10.10.10.2:11434"
-DEFAULT_MODEL = "qwen2.5-coder:7b"
+DEFAULT_MODEL = "qwen3:30b"
 
 def tavily_research(query, max_results=5):
     load_dotenv()

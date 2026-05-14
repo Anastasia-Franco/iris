@@ -1,0 +1,91 @@
+﻿namespace WindowsFormsApp
+{
+    public partial class IRIS_UI : Form
+    {
+        /// <summary>
+        /// Required designer variable.
+        /// </summary>
+        private System.ComponentModel.IContainer components = null;
+
+        /// <summary>
+        /// Clean up any resources being used.
+        /// </summary>
+        /// <param name="disposing">true if managed resources should be disposed; otherwise, false.</param>
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && (this.components != null))
+            {
+                this.components.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+
+        #region Windows Form Designer generated code
+
+        /// <summary>
+        /// Required method for Designer support - do not modify
+        /// the contents of this method with the code editor.
+        /// </summary>
+        private void InitializeComponent()
+        {
+            this.components = new System.ComponentModel.Container();
+            this.txtPrompt = new System.Windows.Forms.TextBox();
+            this.btnSend = new System.Windows.Forms.Button();
+            this.txtStream = new System.Windows.Forms.TextBox();
+            this.SuspendLayout();
+            // 
+            // txtPrompt
+            // 
+            this.txtPrompt.Dock = System.Windows.Forms.DockStyle.Bottom;
+            this.txtPrompt.Location = new System.Drawing.Point(0, 370);
+            this.txtPrompt.Multiline = true;
+            this.txtPrompt.Name = "txtPrompt";
+            this.txtPrompt.Size = new System.Drawing.Size(800, 80);
+            this.txtPrompt.TabIndex = 0;
+            this.txtPrompt.TextChanged += new System.EventHandler(this.TxtPrompt_TextChanged);
+            // 
+            // btnSend
+            // 
+            this.btnSend.BackColor = System.Drawing.SystemColors.AppWorkspace;
+            this.btnSend.Dock = System.Windows.Forms.DockStyle.Bottom;
+            this.btnSend.Location = new System.Drawing.Point(0, 347);
+            this.btnSend.Name = "btnSend";
+            this.btnSend.Size = new System.Drawing.Size(800, 23);
+            this.btnSend.TabIndex = 1;
+            this.btnSend.Text = "Send";
+            this.btnSend.UseVisualStyleBackColor = false;
+            this.btnSend.Click += new System.EventHandler(this.BtnSend_Click);
+            // 
+            // txtStream
+            // 
+            this.txtStream.AccessibleRole = System.Windows.Forms.AccessibleRole.None;
+            this.txtStream.Dock = System.Windows.Forms.DockStyle.Fill;
+            this.txtStream.Location = new System.Drawing.Point(0, 0);
+            this.txtStream.Multiline = true;
+            this.txtStream.Name = "txtStream";
+            this.txtStream.ReadOnly = true;
+            this.txtStream.ScrollBars = System.Windows.Forms.ScrollBars.Vertical;
+            this.txtStream.Size = new System.Drawing.Size(800, 347);
+            this.txtStream.TabIndex = 2;
+            // 
+            // IRIS_UI
+            // 
+            this.AutoScaleDimensions = new System.Drawing.SizeF(6F, 13F);
+            this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
+            this.ClientSize = new System.Drawing.Size(800, 450);
+            this.Controls.Add(this.txtStream);
+            this.Controls.Add(this.btnSend);
+            this.Controls.Add(this.txtPrompt);
+            this.Name = "IRIS_UI";
+            this.Text = "IRIS_UI";
+            this.ResumeLayout(false);
+            this.PerformLayout();
+        }
+
+        #endregion
+
+        private System.Windows.Forms.TextBox txtPrompt;
+        private System.Windows.Forms.Button btnSend;
+        private System.Windows.Forms.TextBox txtStream;
+    }
+}
