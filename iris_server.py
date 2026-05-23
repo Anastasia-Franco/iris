@@ -13,8 +13,10 @@ Environment variables (can also be set in .env):
     IRIS_MAX_CONTEXT_TOKENS — default: 6000
 """
 
+import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import threading
@@ -31,6 +33,13 @@ import iris_memory
 
 load_dotenv()
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("iris")
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -40,6 +49,11 @@ DEFAULT_MODEL      = os.environ.get("IRIS_DEFAULT_MODEL",       "qwen3:30b")
 DB_PATH            = os.environ.get("IRIS_DB_PATH",             "/opt/iris/data/iris_memory.db")
 IDENTITY_FILE      = os.environ.get("IRIS_IDENTITY_FILE",       "/opt/iris/iris_identity.txt")
 MAX_CONTEXT_TOKENS = int(os.environ.get("IRIS_MAX_CONTEXT_TOKENS", "6000"))
+
+# Research orchestration limits
+MAX_RESEARCH_SUBQUERIES  = int(os.environ.get("IRIS_MAX_RESEARCH_SUBQUERIES", "5"))
+MAX_TAVILY_QUERY_LEN     = 380   # Tavily hard-limits queries to ~400 chars; leave headroom
+MAX_RESULTS_PER_SUBQUERY = int(os.environ.get("IRIS_MAX_RESULTS_PER_SUBQUERY", "5"))
 
 # Per-session debug store: session_id → last context debug dict
 _last_context_debug: dict[str, dict] = {}
@@ -142,6 +156,18 @@ def _embed_in_background(message_id: str, text: str, project_id: str = None) -> 
         db.close()
     except Exception:
         pass  # never surface embedding failures to the caller
+
+
+def _embed_note_in_background(note_id: str, content: str, project_id: str = None) -> None:
+    """Embed a promoted memory note with source_type='memory_note'.
+    Enables semantic relevance filtering of project notes in Layer 3 of _build_context()."""
+    try:
+        db = iris_memory.init_db(DB_PATH)
+        iris_memory.embed_and_store(db, note_id, "memory_note", content, OLLAMA_HOST,
+                                    project_id=project_id)
+        db.close()
+    except Exception:
+        pass
 
 
 def _stream_ollama(enriched_prompt: str, model: str):
@@ -281,13 +307,181 @@ def _ingestion_worker() -> None:
 threading.Thread(target=_ingestion_worker, daemon=True, name="iris-ingestion-worker").start()
 
 
+def _decompose_research_intent(intent: str, model: str) -> dict:
+    """Convert a long operator intent into focused, Tavily-safe search queries.
+
+    The full intent NEVER leaves IRIS — only the short decomposed queries are
+    forwarded to Tavily.  Returns a dict:
+        {
+          "topic":          str,        # one-line description of the research area
+          "queries":        list[str],  # 2-5 short queries, each ≤ MAX_TAVILY_QUERY_LEN
+          "synthesis_goal": str,        # what the final synthesis should answer
+        }
+    Falls back gracefully on parse failure.
+    """
+    decomp_prompt = (
+        "You are a research query compiler for a local AI system.\n"
+        "The operator has expressed a research intent that may be long and multi-part.\n"
+        "Your job: decompose it into 2-5 SHORT, focused web-search queries.\n"
+        "Rules:\n"
+        "  - Each query MUST be under 380 characters (ideally 40-150 chars)\n"
+        "  - Each query should target one specific aspect or question\n"
+        "  - Queries must be self-contained — no pronouns like 'it' or 'they'\n"
+        "  - Do NOT include the operator's personal context or governance info\n"
+        "  - Write queries as a researcher would type them into a search engine\n"
+        "  - IMPORTANT: Do NOT silently substitute or correct entity names (game titles,\n"
+        "    class names, build names, season numbers). If a name looks misspelled or\n"
+        "    ambiguous, record it in entity_interpretations — do not guess silently.\n\n"
+        f"Operator intent:\n{intent[:2000]}\n\n"
+        "Return ONLY a JSON object with exactly these keys:\n"
+        "  topic (string): one-line description of the research topic\n"
+        "  queries (array of strings): 2-5 focused search queries\n"
+        "  synthesis_goal (string): what should the final answer address\n"
+        "  entity_interpretations (array): every entity name that was corrected, normalised,\n"
+        "    or was ambiguous. Each item: {original: str, used_as: str, confidence: float 0-1}.\n"
+        "    Use confidence < 0.8 for uncertain interpretations. Empty array if none.\n"
+        "No explanation, no markdown fencing — raw JSON only."
+    )
+    tokens = list(_stream_ollama(decomp_prompt, model))
+    raw = "".join(tokens).strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```\s*$", "", raw.strip())
+    try:
+        result = json.loads(raw)
+        queries = [
+            q[:MAX_TAVILY_QUERY_LEN]
+            for q in result.get("queries", [])
+            if isinstance(q, str) and q.strip()
+        ][:MAX_RESEARCH_SUBQUERIES]
+        if not queries:
+            raise ValueError("no queries parsed")
+        raw_interps = result.get("entity_interpretations", [])
+        entity_interpretations = [
+            i for i in (raw_interps if isinstance(raw_interps, list) else [])
+            if isinstance(i, dict) and i.get("original") and i.get("used_as")
+        ][:10]
+        return {
+            "topic":                 str(result.get("topic", intent[:100])),
+            "queries":               queries,
+            "synthesis_goal":        str(result.get("synthesis_goal", intent))[:1200],
+            "entity_interpretations": entity_interpretations,
+        }
+    except Exception as exc:
+        logger.warning("[Research] Decomposition parse failed (%s) — single-query fallback", exc)
+        return {
+            "topic":                 intent[:100],
+            "queries":               [intent[:MAX_TAVILY_QUERY_LEN]],
+            "synthesis_goal":        intent,
+            "entity_interpretations": [],
+        }
+
+
+def _execute_tavily_queries(
+    queries: list[str],
+    client,
+) -> tuple[list[dict], list[str]]:
+    """Run each decomposed query against Tavily; deduplicate results by URL.
+
+    Returns:
+        sources  — list of dicts: {subquery, url, title, snippet}
+        answers  — list of Tavily inline answers (one per subquery that has one)
+    """
+    seen_urls: set[str] = set()
+    sources: list[dict] = []
+    answers: list[str]  = []
+
+    for i, query in enumerate(queries):
+        logger.info("[Research] Subquery %d/%d: %r", i + 1, len(queries), query[:100])
+        try:
+            resp = client.search(
+                query=query,
+                search_depth="basic",
+                max_results=MAX_RESULTS_PER_SUBQUERY,
+                include_answer=True,
+                include_raw_content=False,
+            )
+        except Exception as exc:
+            logger.warning("[Research]   subquery %d failed: %s", i + 1, exc)
+            continue
+
+        if resp.get("answer"):
+            answers.append(f"[Subquery: {query[:80]}]\n{resp['answer']}")
+            logger.info("[Research]   inline answer: %s", resp["answer"][:100])
+
+        for item in resp.get("results", []):
+            url = item.get("url", "").strip()
+            if not url or url in seen_urls:
+                logger.info("[Research]   skip (dup/empty url): %s", url[:80])
+                continue
+            seen_urls.add(url)
+            snippet = item.get("content") or item.get("snippet") or item.get("raw_content") or ""
+            sources.append({
+                "subquery": query,
+                "url":      url,
+                "title":    item.get("title", "Untitled"),
+                "snippet":  snippet[:600],
+            })
+            logger.info("[Research]   source: %s — %s", item.get("title", "?")[:50], url[:70])
+
+    logger.info(
+        "[Research] Execution complete. unique_sources=%d, answers=%d",
+        len(sources), len(answers),
+    )
+    return sources, answers
+
+
+def _synthesize_research(
+    topic: str,
+    synthesis_goal: str,
+    answers: list[str],
+    sources: list[dict],
+    model: str,
+) -> str:
+    """Local LLM pass: synthesize collected answers and source snippets into a
+    coherent structured response.  The operator intent is used to guide the
+    synthesis goal — it never leaves the local node."""
+    answers_block = "\n\n".join(answers) if answers else "(no inline answers retrieved)"
+    # Cap sources fed into synthesis to avoid overflowing the local model context
+    sources_block = "\n".join(
+        f"- [{s['title']}]({s['url']}):\n  {s['snippet'][:400]}"
+        for s in sources[:12]
+    )
+    synth_prompt = (
+        f"You are IRIS synthesizing research results for a local intelligence system.\n\n"
+        f"Research topic: {topic}\n\n"
+        f"Synthesis goal:\n{synthesis_goal[:800]}\n\n"
+        f"Search engine answers:\n{answers_block[:2500]}\n\n"
+        f"Source excerpts:\n{sources_block[:3000]}\n\n"
+        "Write a clear, structured synthesis. Cover:\n"
+        "  1. Key findings directly relevant to the synthesis goal\n"
+        "  2. Points that are version/patch/time-sensitive (flag them)\n"
+        "  3. Gaps or uncertainties in the retrieved information\n"
+        "Be concise and factual. Cite sources by title where relevant."
+    )
+    tokens = list(_stream_ollama(synth_prompt, model))
+    return "".join(tokens).strip()
+
+
 def _extract_research_candidates(raw_result: str, query: str, model: str) -> list[dict]:
     """Ask the model to extract 3-5 candidate memory notes from a research result."""
     extraction_prompt = (
         f"You completed research on: \"{query}\"\n\n"
         f"Research result:\n{raw_result[:3000]}\n\n"
-        "Extract 3-5 concise facts from this research worth adding to permanent memory.\n"
-        "Return ONLY a JSON array of objects with keys: content (string), scope (string: global or research), tags (string or null).\n"
+        "Extract 3-5 facts worth adding to permanent memory.\n"
+        "CRITICAL: Every fact MUST preserve its entity anchors — game title, character class or entity name, "
+        "build name, and season — both inside the content text AND in the dedicated fields below.\n"
+        "Do NOT write generic facts that strip out 'Warlock', 'Season 13', 'Dread Claws', etc.\n"
+        "Each fact must be self-contained and unambiguous without any surrounding context.\n\n"
+        "Return ONLY a JSON array. Each object must have exactly these keys:\n"
+        "  content       — the full atomic fact; MUST name the game, class/entity, build, and season if known\n"
+        "  scope         — 'research' for game/project-specific facts, 'global' for universal facts\n"
+        "  tags          — comma-separated keywords or null\n"
+        "  game          — game title exactly as found, e.g. 'Diablo IV', or null\n"
+        "  entity_class  — character class or named entity, e.g. 'Warlock', 'Necromancer', or null\n"
+        "  build_topic   — specific build or mechanic name, e.g. 'Dread Claws', 'Blood Lance', or null\n"
+        "  season        — season label exactly as found, e.g. 'Season 13', or null\n"
+        "  note_type     — one of: build_mechanic, stat, lore, patch_note, general\n"
+        "  patch_sensitive — true if this fact may become outdated after a game patch, false otherwise\n\n"
         "No explanation, no markdown fencing — only the raw JSON array."
     )
     tokens = list(_stream_ollama(extraction_prompt, model))
@@ -332,6 +526,14 @@ def _build_context(db, session_id: str, prompt: str, project_id: str = None) -> 
     debug: dict = {"budget": budgets, "max_context_tokens": MAX_CONTEXT_TOKENS}
     context_parts: list[str] = []
 
+    # --- Pre-compute query embedding once — reused by Layer 3 (note relevance filter)
+    # and Layer 5 (document chunk retrieval).  Graceful degradation on failure. ---
+    query_vec: list[float] | None = None
+    try:
+        query_vec = iris_memory.get_embedding(prompt, OLLAMA_HOST)
+    except Exception as _exc:
+        logger.warning("[Context] Query embedding failed — semantic note filter disabled: %s", _exc)
+
     # --- Layer 1: System identity (always present, no cap) ---
     identity = _load_system_identity()
     if identity:
@@ -346,27 +548,158 @@ def _build_context(db, session_id: str, prompt: str, project_id: str = None) -> 
         raw = "\n".join(f"- {n['content']}" for n in op_notes)
         text, used = _apply_budget(raw, budgets["operator"])
         context_parts.append(f"[OPERATOR NOTES]\n{text}")
-        debug["operator"] = {"count": len(op_notes), "tokens": used}
+        debug["operator"] = {
+            "count": len(op_notes),
+            "notes": [{"id": n["id"], "scope": n["scope"], "project_id": n.get("project_id"), "preview": n["content"][:100]} for n in op_notes],
+            "tokens": used,
+        }
         for n in op_notes:
             iris_memory.touch_memory_note(db, n["id"])
 
-    # --- Layer 3: Project notes ---
+    # --- Layer 3: Project notes (scope=project) + research findings (scope=research) ---
     if project_id:
         proj_notes = iris_memory.get_memory_notes(
             db, scope="project", project_id=project_id,
             exclude_states=["archived", "deleted"]
         )
+        # BUG FIX: also include scope=research notes for this project.
+        # Promoted research candidates use scope='research' — without this they are
+        # stored correctly but never injected into context.
+        research_notes = iris_memory.get_memory_notes(
+            db, scope="research", project_id=project_id,
+            exclude_states=["archived", "deleted"]
+        )
+        all_proj_notes = proj_notes + research_notes
         proj = iris_memory.get_project(db, project_id)
         proj_name = proj["name"] if proj else project_id
-        if proj_notes:
-            raw = "\n".join(f"- {n['content']}" for n in proj_notes)
+        logger.info(
+            "[Context] Layer 3 — project=%r: %d project note(s), %d research note(s)",
+            proj_name, len(proj_notes), len(research_notes),
+        )
+        # Relevance filter: select only notes pertinent to the current prompt so that
+        # unrelated builds/characters in the same project are not blindly injected.
+        # Primary:  semantic vector search on "memory_note" embeddings (post-promotion).
+        # Fallback:  keyword match when embeddings are not yet available for older notes.
+        total_proj_notes = len(all_proj_notes)
+        filter_applied   = "none"
+        if all_proj_notes and query_vec is not None:
+            note_hits = iris_memory.search_memory(
+                db, query_vec, top_k=8,
+                source_type="memory_note",
+                project_id=project_id,
+            )
+            if note_hits:
+                threshold    = 0.30
+                relevant_ids = {h["source_id"] for h in note_hits if h["score"] > threshold}
+                if not relevant_ids:
+                    relevant_ids = {note_hits[0]["source_id"]}  # always keep best match
+                filtered = [n for n in all_proj_notes if n["id"] in relevant_ids]
+                if filtered:
+                    logger.info(
+                        "[Context] Note semantic filter: %d → %d notes (threshold=%.2f, scores=%s)",
+                        total_proj_notes, len(filtered), threshold,
+                        [round(h["score"], 3) for h in note_hits[:4]],
+                    )
+                    all_proj_notes = filtered
+                    filter_applied = "semantic"
+        if filter_applied == "none" and all_proj_notes:
+            # Keyword fallback: keep notes that share significant words with the prompt.
+            prompt_tokens = {w.lower() for w in re.split(r"\W+", prompt) if len(w) >= 4}
+            if prompt_tokens:
+                kw_filtered = [
+                    n for n in all_proj_notes
+                    if any(tok in n["content"].lower() for tok in prompt_tokens)
+                ]
+                if kw_filtered:
+                    logger.info(
+                        "[Context] Note keyword filter: %d → %d notes (tokens: %s)",
+                        total_proj_notes, len(kw_filtered), sorted(prompt_tokens)[:5],
+                    )
+                    all_proj_notes = kw_filtered
+                    filter_applied = "keyword"
+        if filter_applied == "none":
+            logger.info(
+                "[Context] No note filter applied; keeping all %d project notes", total_proj_notes
+            )
+        if all_proj_notes:
+            # Prefix each note with its scope so the model can distinguish
+            # project-level notes from research findings and, crucially,
+            # notes about different characters/builds within the same project.
+            raw = "\n".join(f"- [{n['scope']}] {n['content']}" for n in all_proj_notes)
             text, used = _apply_budget(raw, budgets["project"])
             context_parts.append(f"[PROJECT: {proj_name}]\n{text}")
-            debug["project"] = {"name": proj_name, "count": len(proj_notes), "tokens": used}
-            for n in proj_notes:
+            debug["project"] = {
+                "name":           proj_name,
+                "count":          total_proj_notes,
+                "injected_count": len(all_proj_notes),
+                "filter_applied": filter_applied,
+                "notes": [
+                    {"id": n["id"], "scope": n["scope"], "project_id": n.get("project_id"), "preview": n["content"][:100]}
+                    for n in all_proj_notes
+                ],
+                "tokens": used,
+            }
+            for n in all_proj_notes:
                 iris_memory.touch_memory_note(db, n["id"])
 
-    # --- Layer 4: Global memory ---
+            # Grounding rules: injected immediately after project notes so the model
+            # reads them before any conversation history.  Only present when project
+            # notes exist — no-op for global / no-project sessions.
+            grounding = (
+                f"[GROUNDING RULES — project: {proj_name}]\n"
+                f"\n"
+                f"AUTHORITY HIERARCHY (highest → lowest priority):\n"
+                f"  1. Operator correction in the current message\n"
+                f"  2. Project notes injected above as [{proj_name}] memory\n"
+                f"  3. Retrieved global memory\n"
+                f"  4. Your model prior knowledge (lowest — do not use to contradict 1–3)\n"
+                f"\n"
+                f"WHEN THE OPERATOR CORRECTS YOU:\n"
+                f"- Acknowledge the correction immediately. Do not argue or defend your prior answer.\n"
+                f"- Check the injected project notes for supporting evidence.\n"
+                f"- If the notes confirm the operator, state that explicitly.\n"
+                f"- If the notes are silent on the topic, say: "
+                f"\"I don't see that in my current project notes — I'll take your correction.\"\n"
+                f"- If you may have conflated notes, say: "
+                f"\"I may be conflating notes. Let me inspect the project memory.\"\n"
+                f"- NEVER claim no memory failure occurred when the operator says you are wrong.\n"
+                f"- NEVER say you cannot be rebuilt, corrected, or updated.\n"
+                f"- NEVER tell the operator they cannot modify, override, or correct you.\n"
+                f"\n"
+                f"USING PROJECT NOTES — HARD LIMITS (never cross these):\n"
+                f"- Do NOT fabricate damage numbers, percentages, simulation results, or game mechanics "
+                f"not present in the notes.\n"
+                f"- Do NOT conflate notes about different characters, skills, or builds.\n"
+                f"- Do NOT use model prior knowledge to contradict what the notes say.\n"
+                f"\n"
+                f"ANALYSIS AND SYNTHESIS (encouraged):\n"
+                f"- You are allowed — and expected — to reason beyond the literal text of the notes.\n"
+                f"- Draw inferences, implications, and comparisons from the notes. Label them clearly:\n"
+                f"  \"Based on the notes, a likely implication is…\"\n"
+                f"  \"An inference from the sources is…\"\n"
+                f"  \"The notes suggest, but do not prove, that…\"\n"
+                f"- Compare and contrast notes — this is useful analysis, not speculation.\n"
+                f"- If note detail is thin, preserve uncertainty rather than filling gaps from prior knowledge.\n"
+                f"- Do NOT flatten your response to verbatim note repetition.\n"
+                f"- Do NOT say \"I only know these notes\" unless the operator explicitly requests "
+                f"memory-only mode.\n"
+                f"\n"
+                f"The project notes are anchors for factual accuracy — not a ceiling on your analysis."
+            )
+            context_parts.append(grounding)
+            debug["grounding"] = {"injected": True, "project": proj_name}
+
+            # Reduce recent-conversation budget when project notes are present so that
+            # stale conversation about a different character cannot outweigh project memory.
+            budgets["conversation"] = budgets["conversation"] // 2
+            logger.info(
+                "[Context] Grounding rules injected for project=%r; conversation budget halved to %d tokens",
+                proj_name, budgets["conversation"],
+            )
+        else:
+            debug["project"] = {"name": proj_name, "count": 0, "notes": []}
+
+    # --- Layer 4: Global memory (scope=global, no project association) ---
     global_notes = iris_memory.get_memory_notes(
         db, scope="global", exclude_states=["archived", "deleted"]
     )
@@ -376,37 +709,67 @@ def _build_context(db, session_id: str, prompt: str, project_id: str = None) -> 
         raw = "\n".join(f"- {n['content']}" for n in global_notes)
         text, used = _apply_budget(raw, budgets["global"])
         context_parts.append(f"[GLOBAL MEMORY]\n{text}")
-        debug["global"] = {"count": len(global_notes), "tokens": used}
+        debug["global"] = {
+            "count": len(global_notes),
+            "notes": [{"id": n["id"], "scope": n["scope"], "project_id": n.get("project_id"), "preview": n["content"][:100]} for n in global_notes],
+            "tokens": used,
+        }
         for n in global_notes:
             iris_memory.touch_memory_note(db, n["id"])
 
-    # --- Layer 5: Retrieved chunks (semantic search) ---
+    # --- Layer 5: Retrieved chunks (semantic search, project-scoped) ---
+    # BUG FIX: always pass project_id so retrieval never crosses project boundaries.
+    # When no project is active, project_id=None returns unfiltered results (correct
+    # for global sessions). When a project is active, only that project's embedded
+    # documents are searched — preventing cross-project context leakage.
     try:
-        query_vec = iris_memory.get_embedding(prompt, OLLAMA_HOST)
-        hits = iris_memory.search_memory(db, query_vec, top_k=3, source_type="document_chunk")
+        if query_vec is None:  # reuse pre-computed embedding from top of _build_context
+            query_vec = iris_memory.get_embedding(prompt, OLLAMA_HOST)
+        hits = iris_memory.search_memory(
+            db, query_vec, top_k=5,
+            source_type="document_chunk",
+            project_id=project_id,          # ← governance boundary enforced here
+        )
+        logger.info(
+            "[Context] Layer 5 — semantic retrieval: project_filter=%r, hits=%d",
+            project_id, len(hits),
+        )
         if hits:
             chunk_lines: list[str] = []
             retrieval_debug: list[dict] = []
-            for hit in hits:
+            for hit in hits[:3]:
                 chunk_row = db.execute(
                     "SELECT heading_path, document_id FROM document_chunks WHERE id = ?",
                     (hit["source_id"],),
                 ).fetchone()
                 doc_row = db.execute(
-                    "SELECT filename FROM documents WHERE id = ?",
+                    "SELECT filename, project_id FROM documents WHERE id = ?",
                     (chunk_row["document_id"],),
                 ).fetchone() if chunk_row else None
                 if chunk_row and doc_row:
                     label = f"[Source: {doc_row['filename']} > {chunk_row['heading_path'] or 'root'}]"
-                    retrieval_debug.append({"source": label, "score": round(hit["score"], 3)})
+                    entry = {
+                        "source": label,
+                        "score": round(hit["score"], 3),
+                        "doc_project_id": doc_row["project_id"],
+                        "embedding_project_id": hit.get("project_id"),
+                    }
+                    logger.info("[Context]   chunk score=%.3f doc_project=%r %s",
+                                hit["score"], doc_row["project_id"], label)
+                    retrieval_debug.append(entry)
                     chunk_lines.append(f"{label}\n{hit['chunk_text']}")
             if chunk_lines:
                 raw = "\n\n".join(chunk_lines)
                 text, used = _apply_budget(raw, budgets["retrieval"])
                 context_parts.append(f"[RETRIEVED CHUNKS]\n{text}")
-                debug["retrieval"] = {"hits": retrieval_debug, "tokens": used}
-    except Exception:
-        pass  # embedding failures never block the response
+                debug["retrieval"] = {
+                    "hits": retrieval_debug,
+                    "tokens": used,
+                    "project_filter": project_id,
+                }
+    except Exception as _exc:
+        logger.warning("[Context] Layer 5 embedding/retrieval failed: %s", _exc)
+        # embedding failures never block the response
 
     # --- Layers 6 + 7: Session summary and recent conversation ---
     summary_text, recent = iris_memory.get_context_with_budget(
@@ -423,7 +786,10 @@ def _build_context(db, session_id: str, prompt: str, project_id: str = None) -> 
         ]
         raw = "\n".join(conv_lines)
         text, used = _apply_budget(raw, budgets["conversation"])
-        context_parts.append(f"[RECENT CONVERSATION]\n{text}")
+        context_parts.append(
+            f"[RECENT CONVERSATION — supplementary; if it conflicts with project notes "
+            f"above, project notes take precedence]\n{text}"
+        )
         debug["conversation"] = {"messages": len(recent), "tokens": used}
 
     # --- Layer 8: Current prompt ---
@@ -456,6 +822,9 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     _last_context_debug[session_id] = context_debug
 
     iris_memory.save_message(db, session_id, "user", req.prompt, model=req.model)
+    # Close the request-thread connection now — save_results() runs in a different
+    # thread (Starlette BackgroundTask) and must not reuse this connection.
+    db.close()
 
     full_response: list[str] = []
     start_time = time.time()
@@ -466,12 +835,18 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
             yield token
 
     def save_results():
+        """Background task: runs in a Starlette thread-pool thread.
+        Opens its own SQLite connection — never reuses the request-thread connection."""
         response_text = "".join(full_response)
         duration_ms = int((time.time() - start_time) * 1000)
-        assistant_msg_id = iris_memory.save_message(
-            db, session_id, "assistant", response_text, model=req.model
-        )
-        iris_memory.save_model_run(db, session_id, assistant_msg_id, req.model, duration_ms)
+        db2 = iris_memory.init_db(DB_PATH)
+        try:
+            assistant_msg_id = iris_memory.save_message(
+                db2, session_id, "assistant", response_text, model=req.model
+            )
+            iris_memory.save_model_run(db2, session_id, assistant_msg_id, req.model, duration_ms)
+        finally:
+            db2.close()
         embed_thread = threading.Thread(
             target=_embed_in_background,
             args=(assistant_msg_id, response_text, req.project_id),
@@ -479,59 +854,180 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
         )
         embed_thread.start()
         embed_thread.join(timeout=8)
-        db.close()
 
     background_tasks.add_task(save_results)
     return StreamingResponse(generate(), media_type="text/plain; charset=utf-8")
 
 
-async def _handle_research(req: ChatRequest) -> PlainTextResponse:
-    """Research mode: query Tavily, extract candidate notes, save to review cache."""
-    try:
-        from tavily import TavilyClient
-    except ImportError:
-        raise HTTPException(status_code=500, detail="tavily-python not installed")
+async def _handle_research(req: ChatRequest) -> StreamingResponse:
+    """Research orchestration pipeline — streams progress markers to the client.
 
-    api_key = os.getenv("TAVILY_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=500, detail="TAVILY_API_KEY not set")
+        Operator Intent
+         → [1] Query Decomposition  (local LLM — intent stays on-node)
+         → [2] Multi-Query Tavily   (only short, neutral subqueries leave IRIS)
+         → [3] Source Deduplication
+         → [4] Local Synthesis      (local LLM)
+         → [5] Candidate Extraction (local LLM)
+         → [6] Research Cache       (pending review in Memory Admin)
+    """
+    logger.info("[Research] Intent received: %r", req.prompt[:120])
 
-    client = TavilyClient(api_key=api_key)
-    results = client.search(
-        query=req.prompt,
-        search_depth="advanced",
-        max_results=5,
-        include_answer=True,
-        include_raw_content=False,
-    )
+    async def _generate():
+        # ── 1. Import / key guards ─────────────────────────────────────────
+        try:
+            from tavily import TavilyClient
+        except ImportError:
+            yield (
+                "[Research ERROR] tavily-python is not installed on the server.\n"
+                "Fix: sudo /opt/iris/venv/bin/pip install tavily-python"
+            )
+            return
+        api_key = os.getenv("TAVILY_API_KEY")
+        if not api_key:
+            yield (
+                "[Research ERROR] TAVILY_API_KEY is not set in the server environment.\n"
+                "Fix: add TAVILY_API_KEY=tvly-... to /opt/iris/.env and restart iris-api."
+            )
+            return
+        client = TavilyClient(api_key=api_key)
+        loop = asyncio.get_event_loop()
 
-    raw_result = ""
-    if results.get("answer"):
-        raw_result += f"IRIS Research Answer:\n\n{results['answer']}\n\n"
-    if results.get("results"):
-        raw_result += "Sources:\n\n"
-        for r in results["results"]:
-            raw_result += f"- {r.get('title', 'Untitled')}\n  {r.get('url', '')}\n"
+        # ── 2. Query decomposition ─────────────────────────────────────────
+        yield "[⟳ Research] Decomposing intent into search queries…\n"
+        logger.info("[Research] Decomposing intent into subqueries...")
+        try:
+            decomposition = await loop.run_in_executor(
+                None, _decompose_research_intent, req.prompt, req.model
+            )
+            logger.info("[Research] Topic: %r", decomposition["topic"])
+            for i, q in enumerate(decomposition["queries"]):
+                logger.info("[Research] Subquery[%d]: %r (len=%d)", i, q[:100], len(q))
+        except Exception as exc:
+            logger.warning("[Research] Decomposition failed (%s) — single-query fallback", exc)
+            decomposition = {
+                "topic":                 req.prompt[:100],
+                "queries":               [req.prompt[:MAX_TAVILY_QUERY_LEN]],
+                "synthesis_goal":        req.prompt,
+                "entity_interpretations": [],
+            }
 
-    # Extract candidate notes via second LLM call
-    candidates = _extract_research_candidates(raw_result, req.prompt, req.model)
+        # Surface any entity interpretation warnings in the stream
+        for interp in decomposition.get("entity_interpretations", []):
+            orig = (interp.get("original") or "").strip()
+            used = (interp.get("used_as") or "").strip()
+            if orig and used and orig.lower() != used.lower():
+                conf = float(interp.get("confidence", 1.0))
+                if conf < 0.8:
+                    yield f"[⚠ Ambiguous] '{orig}' → '{used}' ({conf:.0%} confidence)\n"
+                else:
+                    yield f"[ℹ Interpreted] '{orig}' as '{used}'\n"
 
-    # Save to research cache for operator review
-    session_id = req.session_id or str(uuid.uuid4())
-    db = _get_db()
-    iris_memory.create_session(db, session_id, model=req.model, mode="research",
-                               project_id=req.project_id)
-    iris_memory.save_research_cache(
-        db, session_id, req.project_id or "", req.prompt, raw_result, candidates
-    )
-    db.close()
+        # ── 3. Tavily execution ────────────────────────────────────────────
+        n_queries = len(decomposition["queries"])
+        yield f"[⟳ Research] Running {n_queries} web quer{'y' if n_queries == 1 else 'ies'} via Tavily…\n"
+        try:
+            sources, answers = await loop.run_in_executor(
+                None, _execute_tavily_queries, decomposition["queries"], client
+            )
+        except Exception as exc:
+            msg = f"[Research ERROR] Tavily execution failed: {exc}"
+            logger.error(msg)
+            yield msg
+            return
 
-    summary = (
-        f"{raw_result}\n\n---\n"
-        f"Research captured. {len(candidates)} candidate note(s) saved to review queue.\n"
-        f"Use GET /research/pending to review and promote."
-    )
-    return PlainTextResponse(summary)
+        if not sources and not answers:
+            yield (
+                "[Research] No results returned from any subquery.\n"
+                f"Subqueries attempted:\n"
+                + "\n".join(f"  - {q}" for q in decomposition["queries"])
+                + "\n\nCheck your TAVILY_API_KEY quota or try a simpler research intent."
+            )
+            return
+
+        yield f"[⟳ Research] Synthesising {len(sources)} source(s)…\n"
+
+        # ── 4. Local synthesis ─────────────────────────────────────────────
+        logger.info("[Research] Synthesizing %d sources + %d answers...", len(sources), len(answers))
+        try:
+            synthesis = await loop.run_in_executor(
+                None, _synthesize_research,
+                decomposition["topic"], decomposition["synthesis_goal"],
+                answers, sources, req.model
+            )
+            logger.info("[Research] Synthesis: %d chars", len(synthesis))
+        except Exception as exc:
+            logger.warning("[Research] Synthesis failed: %s", exc)
+            synthesis = "\n\n".join(answers) if answers else "(synthesis unavailable — see sources below)"
+
+        # ── 5. Candidate note extraction ───────────────────────────────────
+        yield "[⟳ Research] Extracting structured memory candidates…\n"
+        logger.info("[Research] Extracting candidate memory notes...")
+        try:
+            candidates = await loop.run_in_executor(
+                None, _extract_research_candidates, synthesis, req.prompt, req.model
+            )
+            logger.info("[Research] Extracted %d candidate note(s)", len(candidates))
+        except Exception as exc:
+            logger.warning("[Research] Candidate extraction failed: %s", exc)
+            candidates = []
+
+        # ── 6. Build result text ───────────────────────────────────────────
+        subquery_lines = "\n".join(
+            f"  {i + 1}. {q}" for i, q in enumerate(decomposition["queries"])
+        )
+        source_lines = "\n".join(
+            f"  [{s['title']}]({s['url']}) — via: \"{s['subquery'][:60]}\""
+            for s in sources
+        )
+        raw_result = (
+            f"Research Topic: {decomposition['topic']}\n\n"
+            f"Subqueries generated ({len(decomposition['queries'])}):\n{subquery_lines}\n\n"
+            f"Synthesis:\n{synthesis}\n\n"
+            f"Sources ({len(sources)} unique):\n{source_lines}\n"
+        )
+
+        # ── 7. Save to research cache ──────────────────────────────────────
+        session_id = req.session_id or str(uuid.uuid4())
+        try:
+            db = _get_db()
+            iris_memory.create_session(db, session_id, model=req.model, mode="research",
+                                       project_id=req.project_id)
+            trace = {
+                "topic":                  decomposition["topic"],
+                "original_prompt":        req.prompt,
+                "queries":                decomposition["queries"],
+                "query_count":            len(decomposition["queries"]),
+                "entity_interpretations": decomposition.get("entity_interpretations", []),
+                "sources":                [
+                    {"title": s["title"], "url": s["url"], "subquery": s["subquery"]}
+                    for s in sources
+                ],
+                "source_count":     len(sources),
+                "answers_count":    len(answers),
+                "synthesis_length": len(synthesis),
+                "candidate_count":  len(candidates),
+                "model":            req.model,
+            }
+            iris_memory.save_research_cache(
+                db, session_id, req.project_id or "", req.prompt, raw_result, candidates,
+                trace=trace, model=req.model,
+            )
+            db.close()
+            logger.info("[Research] Cache saved. session=%s candidates=%d", session_id, len(candidates))
+        except Exception as exc:
+            logger.error("[Research] Cache save failed: %s", exc)
+
+        # ── 8. Yield final result to client ────────────────────────────────
+        yield "\n"
+        yield raw_result
+        yield (
+            f"---\n"
+            f"Research complete. {len(candidates)} candidate note(s) queued for review.\n"
+            f"Open Memory Admin → Research Review to promote notes to project memory."
+        )
+        logger.info("[Research] Pipeline complete.")
+
+    return StreamingResponse(_generate(), media_type="text/plain; charset=utf-8")
 
 
 
@@ -759,12 +1255,80 @@ async def delete_document(doc_id: str):
 # Routes — Research cache
 # ---------------------------------------------------------------------------
 
+@app.post("/research/preview")
+async def research_preview(req: ChatRequest):
+    """Fast decomposition preview — runs only the LLM decomposition step.
+
+    Returns topic, generated queries, and entity interpretation warnings.
+    No Tavily calls, no synthesis. Typically completes in 5-15 seconds.
+    WinForms uses this to show a confirmation dialog before committing to a
+    full research run.
+    """
+    loop = asyncio.get_event_loop()
+    try:
+        decomposition = await loop.run_in_executor(
+            None, _decompose_research_intent, req.prompt, req.model
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Decomposition failed: {exc}")
+
+    warnings: list[str] = []
+    for interp in decomposition.get("entity_interpretations", []):
+        orig = (interp.get("original") or "").strip()
+        used = (interp.get("used_as") or "").strip()
+        if not orig or not used:
+            continue
+        if orig.lower() == used.lower():
+            continue
+        conf = float(interp.get("confidence", 1.0))
+        if conf < 0.8:
+            warnings.append(
+                f"⚠ Uncertain: '{orig}' → '{used}' ({conf:.0%} confidence) — "
+                f"correct your intent if this is wrong"
+            )
+        else:
+            warnings.append(f"Interpreted '{orig}' as '{used}'")
+
+    logger.info(
+        "[Research/preview] topic=%r queries=%d warnings=%d",
+        decomposition["topic"], len(decomposition["queries"]), len(warnings),
+    )
+    return {
+        "topic":                  decomposition["topic"],
+        "queries":                decomposition["queries"],
+        "synthesis_goal":         decomposition["synthesis_goal"],
+        "entity_interpretations": decomposition.get("entity_interpretations", []),
+        "warnings":               warnings,
+    }
+
+
 @app.get("/research/pending")
 async def list_pending_research(project_id: str | None = None):
     db = _get_db()
     items = iris_memory.get_pending_research(db, project_id=project_id)
     db.close()
     return items
+
+
+@app.get("/research/recent")
+async def list_recent_research(limit: int = 50, project_id: str | None = None):
+    """Return all research runs (any state) ordered newest-first, for the Trace tab.
+    Does not include raw_result to keep the payload small."""
+    db = _get_db()
+    items = iris_memory.get_all_research(db, project_id=project_id, limit=limit)
+    db.close()
+    return items
+
+
+@app.get("/research/{cache_id}/trace")
+async def get_research_trace(cache_id: str):
+    """Return the full research cache record (including raw_result) for trace detail view."""
+    db = _get_db()
+    record = iris_memory.get_research_by_id(db, cache_id)
+    db.close()
+    if not record:
+        raise HTTPException(status_code=404, detail="Research run not found")
+    return record
 
 
 @app.post("/research/{cache_id}/promote")
@@ -781,17 +1345,45 @@ async def promote_research(cache_id: str, req: ResearchPromoteRequest):
 
     promoted_ids = []
     for note in req.selected_notes:
+        # Build anchor prefix from structured entity fields so the identity
+        # context is preserved inside the stored content itself.
+        anchor_parts = [
+            note.get("game") or "",
+            note.get("entity_class") or "",
+            note.get("build_topic") or "",
+            note.get("season") or "",
+        ]
+        anchor_parts = [p for p in anchor_parts if p]
+        base_content = note.get("content", "")
+        if anchor_parts:
+            full_content = f"[{' | '.join(anchor_parts)}]\n{base_content}"
+        else:
+            full_content = base_content
+
         note_id = iris_memory.add_memory_note(
             db,
-            content=note.get("content", ""),
+            content=full_content,
             tags=note.get("tags"),
             scope=note.get("scope", "research"),
             state=note.get("state", "durable"),
             project_id=row["project_id"] or None,
             source="research",
             source_session_id=row["session_id"],
+            game=note.get("game") or None,
+            entity_class=note.get("entity_class") or None,
+            build_topic=note.get("build_topic") or None,
+            season=note.get("season") or None,
+            note_type=note.get("note_type") or None,
+            patch_sensitive=bool(note.get("patch_sensitive", False)),
         )
         promoted_ids.append(note_id)
+        # Embed the promoted note so it is available for semantic note-relevance
+        # filtering in Layer 3 of _build_context().  source_type="memory_note".
+        threading.Thread(
+            target=_embed_note_in_background,
+            args=(note_id, note.get("content", ""), row["project_id"] or None),
+            daemon=True,
+        ).start()
 
     iris_memory.update_research_state(db, cache_id, "promoted")
     db.close()

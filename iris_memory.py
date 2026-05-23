@@ -17,7 +17,6 @@ DEFAULT_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data
 
 _DEFAULT_PROJECTS = [
     ("IRIS", "Core system development and infrastructure"),
-    ("Hardware Lab", "Hardware research, configuration, and lab work"),
 ]
 
 
@@ -195,6 +194,16 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         ("memory_notes",      "source_session_id TEXT"),
         ("memory_notes",      "generated_by_model TEXT"),
         ("documents",          "raw_content TEXT"),
+        # Entity anchor columns — preserve identity context extracted during research
+        ("memory_notes",      "game TEXT"),
+        ("memory_notes",      "entity_class TEXT"),
+        ("memory_notes",      "build_topic TEXT"),
+        ("memory_notes",      "season TEXT"),
+        ("memory_notes",      "note_type TEXT"),
+        ("memory_notes",      "patch_sensitive INTEGER NOT NULL DEFAULT 0"),
+        # Research trace — structured metadata for the Research Trace tab
+        ("research_cache",    "trace_json TEXT"),
+        ("research_cache",    "model TEXT"),
     ]
     for table, col_def in migrations:
         try:
@@ -419,6 +428,13 @@ def add_memory_note(
     source_chunk_id: str = None,
     generated_by_model: str = None,
     origin_note_id: str = None,
+    # Entity anchor fields — preserve identity context extracted during research
+    game: str = None,
+    entity_class: str = None,
+    build_topic: str = None,
+    season: str = None,
+    note_type: str = None,
+    patch_sensitive: bool = False,
 ) -> str:
     """Promote a fact into long-term memory with full provenance."""
     note_id = str(uuid.uuid4())
@@ -426,11 +442,13 @@ def add_memory_note(
         """INSERT INTO memory_notes
            (id, content, tags, scope, state, project_id, created_at, promoted_at,
             confidence, source, source_session_id, source_document_id, source_chunk_id,
-            generated_by_model, origin_note_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            generated_by_model, origin_note_id,
+            game, entity_class, build_topic, season, note_type, patch_sensitive)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (note_id, content, tags, scope, state, project_id, _now(), _now(),
          confidence, source, source_session_id, source_document_id, source_chunk_id,
-         generated_by_model, origin_note_id),
+         generated_by_model, origin_note_id,
+         game, entity_class, build_topic, season, note_type, int(patch_sensitive)),
     )
     conn.commit()
     return note_id
@@ -466,7 +484,8 @@ def get_memory_notes(
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     cursor = conn.execute(
         f"""SELECT id, content, tags, scope, state, project_id, created_at,
-                   confidence, last_used_at, usage_count, source, generated_by_model
+                   confidence, last_used_at, usage_count, source, generated_by_model,
+                   game, entity_class, build_topic, season, note_type, patch_sensitive
             FROM memory_notes {where}
             ORDER BY usage_count DESC, confidence DESC, created_at ASC""",
         params,
@@ -688,12 +707,22 @@ def save_research_cache(
     query: str,
     raw_result: str,
     candidate_notes: list[dict],
+    trace: dict = None,
+    model: str = None,
 ) -> str:
     cache_id = str(uuid.uuid4())
     conn.execute(
-        """INSERT INTO research_cache (id, session_id, project_id, query, raw_result, candidate_notes, state, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)""",
-        (cache_id, session_id, project_id, query, raw_result, json.dumps(candidate_notes), _now()),
+        """INSERT INTO research_cache
+               (id, session_id, project_id, query, raw_result, candidate_notes,
+                trace_json, model, state, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)""",
+        (
+            cache_id, session_id, project_id, query, raw_result,
+            json.dumps(candidate_notes),
+            json.dumps(trace) if trace else None,
+            model,
+            _now(),
+        ),
     )
     conn.commit()
     return cache_id
@@ -726,6 +755,54 @@ def update_research_state(conn: sqlite3.Connection, cache_id: str, state: str) -
         (state, _now(), cache_id),
     )
     conn.commit()
+
+
+def get_all_research(
+    conn: sqlite3.Connection,
+    project_id: str = None,
+    limit: int = 50,
+) -> list[dict]:
+    """Return research runs of any state, newest first — for the Research Trace tab.
+    Excludes raw_result to keep payloads small; use get_research_by_id for the full record."""
+    if project_id:
+        cursor = conn.execute(
+            "SELECT id, session_id, project_id, query, candidate_notes, trace_json, model, state, created_at, reviewed_at "
+            "FROM research_cache WHERE project_id = ? ORDER BY created_at DESC LIMIT ?",
+            (project_id, limit),
+        )
+    else:
+        cursor = conn.execute(
+            "SELECT id, session_id, project_id, query, candidate_notes, trace_json, model, state, created_at, reviewed_at "
+            "FROM research_cache ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        )
+    rows = []
+    for row in cursor.fetchall():
+        d = dict(row)
+        if d.get("candidate_notes"):
+            d["candidate_notes"] = json.loads(d["candidate_notes"])
+        if d.get("trace_json"):
+            d["trace_json"] = json.loads(d["trace_json"])
+        rows.append(d)
+    return rows
+
+
+def get_research_by_id(conn: sqlite3.Connection, cache_id: str) -> dict | None:
+    """Return the full research cache record including raw_result, for the trace detail view."""
+    row = conn.execute(
+        "SELECT id, session_id, project_id, query, raw_result, candidate_notes, "
+        "trace_json, model, state, created_at, reviewed_at "
+        "FROM research_cache WHERE id = ?",
+        (cache_id,),
+    ).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    if d.get("candidate_notes"):
+        d["candidate_notes"] = json.loads(d["candidate_notes"])
+    if d.get("trace_json"):
+        d["trace_json"] = json.loads(d["trace_json"])
+    return d
 
 
 # ---------------------------------------------------------------------------

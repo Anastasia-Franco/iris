@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("WindowsFormsApp")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+11c8d1de93fbfe8c9c2349acd8d69234bf709ac9")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+5bc68f3bff8b720f288cdea2e5b4acb45cc50b90")]
 [assembly: System.Reflection.AssemblyProductAttribute("WindowsFormsApp")]
 [assembly: System.Reflection.AssemblyTitleAttribute("WindowsFormsApp")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

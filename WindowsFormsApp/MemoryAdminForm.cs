@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.Net.Http;
 using System.Text;
@@ -23,6 +24,9 @@ namespace WindowsFormsApp
         };
 
         private readonly string _callerSessionId;
+
+        /// <summary>Fired after any project create / edit / archive operation.</summary>
+        public event EventHandler? ProjectsChanged;
 
         // ── Controls ──────────────────────────────────────────────────────
         private TabControl tabMain;
@@ -57,6 +61,17 @@ namespace WindowsFormsApp
         private Button btnDeleteDoc;
         private Button btnRefreshDocs;
 
+        // Projects tab
+        private TabPage tabProjects;
+        private DataGridView gridProjects;
+        private TextBox txtProjName;
+        private TextBox txtProjDesc;
+        private ComboBox cmbProjStatus;
+        private Button btnNewProject;
+        private Button btnSaveProject;
+        private Button btnArchiveProject;
+        private string _selectedProjectId = "";
+
         // Research tab
         private TabPage tabResearch;
         private DataGridView gridResearch;
@@ -65,6 +80,13 @@ namespace WindowsFormsApp
         private Button btnPromoteResearch;
         private Button btnDiscardResearch;
         private Button btnRefreshResearch;
+
+        // Research Trace tab
+        private TabPage tabTrace;
+        private DataGridView gridTrace;
+        private TextBox txtTraceDetail;
+        private Button btnRefreshTrace;
+        private string _selectedTraceId = "";
 
         private string _selectedNoteId = "";
         private string _selectedDocId  = "";
@@ -91,13 +113,16 @@ namespace WindowsFormsApp
             // Tab control
             tabMain = new TabControl { Dock = DockStyle.Fill };
             tabMain.DrawMode = TabDrawMode.OwnerDrawFixed;
+            tabMain.DrawItem += TabMain_DrawItem;
             Controls.Add(tabMain);
 
             BuildMemoryTab();
             BuildDocumentsTab();
             BuildResearchTab();
+            BuildTraceTab();
+            BuildProjectsTab();
 
-            tabMain.TabPages.AddRange(new[] { tabMemory, tabDocs, tabResearch });
+            tabMain.TabPages.AddRange(new[] { tabMemory, tabDocs, tabResearch, tabTrace, tabProjects });
             tabMain.SelectedIndexChanged += (_, _) => OnTabChanged();
         }
 
@@ -276,58 +301,77 @@ namespace WindowsFormsApp
         {
             tabResearch = new TabPage("Research Review") { BackColor = Color.FromArgb(30, 30, 30), ForeColor = Color.White };
 
-            // Top: research items grid
+            // ── Button strip (Dock=Bottom, always visible) ─────────────────
+            var btnPanel = new Panel
+            {
+                Dock = DockStyle.Bottom, Height = 36,
+                BackColor = Color.FromArgb(30, 30, 30), Padding = new Padding(6, 5, 6, 5)
+            };
+            btnRefreshResearch = MakeButton("Refresh",          new Point(0, 4),   new Size(110, 26));
+            btnRefreshResearch.Click += (_, _) => _ = RefreshResearchAsync();
+            btnPromoteResearch = MakeButton("Promote Selected", new Point(118, 4), new Size(140, 26));
+            btnPromoteResearch.BackColor = Color.FromArgb(0, 120, 60);
+            btnPromoteResearch.Click += (_, _) => _ = PromoteResearchAsync();
+            btnDiscardResearch = MakeButton("Discard",          new Point(266, 4), new Size(100, 26));
+            btnDiscardResearch.BackColor = Color.DarkRed;
+            btnDiscardResearch.Click += (_, _) => _ = DiscardResearchAsync();
+            btnPanel.Controls.AddRange(new Control[] { btnRefreshResearch, btnPromoteResearch, btnDiscardResearch });
+
+            // ── Candidate checklist (Dock=Bottom, grows upward from button strip) ──
+            lstCandidates = new CheckedListBox
+            {
+                Dock = DockStyle.Bottom, Height = 180,
+                BackColor = Color.FromArgb(45, 45, 45), ForeColor = Color.White, Font = new Font("Consolas", 9f)
+            };
+            var lblCands = new Label
+            {
+                Text = "Candidate Notes — check to promote:", ForeColor = Color.Silver,
+                Dock = DockStyle.Bottom, Height = 18, TextAlign = ContentAlignment.BottomLeft,
+                Padding = new Padding(6, 0, 0, 0)
+            };
+
+            // ── Raw result box (Dock=Bottom, above candidates) ─────────────
+            txtResearchRaw = new TextBox
+            {
+                Dock = DockStyle.Bottom, Height = 100,
+                Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical,
+                BackColor = Color.FromArgb(40, 40, 40), ForeColor = Color.LightGray, Font = new Font("Consolas", 9f)
+            };
+            var lblRaw = new Label
+            {
+                Text = "Raw Result:", ForeColor = Color.Silver,
+                Dock = DockStyle.Bottom, Height = 18, TextAlign = ContentAlignment.BottomLeft,
+                Padding = new Padding(6, 0, 0, 0)
+            };
+
+            // ── Research grid (Dock=Fill — takes all remaining top space) ──
             gridResearch = new DataGridView
             {
-                Location = new Point(6, 6), Height = 200, Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
+                Dock = DockStyle.Fill,
                 BackgroundColor = Color.FromArgb(40, 40, 40), ForeColor = Color.White,
                 ColumnHeadersDefaultCellStyle = { BackColor = Color.FromArgb(60, 60, 60), ForeColor = Color.White },
                 DefaultCellStyle = { BackColor = Color.FromArgb(45, 45, 45), ForeColor = Color.White, SelectionBackColor = Color.SteelBlue },
                 ReadOnly = true, SelectionMode = DataGridViewSelectionMode.FullRowSelect,
                 MultiSelect = false, AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill
             };
-            gridResearch.Columns.Add(new DataGridViewTextBoxColumn { Name = "colResId",   HeaderText = "ID",    FillWeight = 10 });
-            gridResearch.Columns.Add(new DataGridViewTextBoxColumn { Name = "colResQuery", HeaderText = "Query", FillWeight = 50 });
-            gridResearch.Columns.Add(new DataGridViewTextBoxColumn { Name = "colResDate",  HeaderText = "Date",  FillWeight = 20 });
-            gridResearch.Columns.Add(new DataGridViewTextBoxColumn { Name = "colResCands", HeaderText = "Candidates", FillWeight = 10 });
-            gridResearch.SelectionChanged += GridResearch_SelectionChanged;
+            gridResearch.Columns.Add(new DataGridViewTextBoxColumn { Name = "colResId",   HeaderText = "ID",         FillWeight = 10 });
+            gridResearch.Columns.Add(new DataGridViewTextBoxColumn { Name = "colResQuery", HeaderText = "Query",      FillWeight = 55 });
+            gridResearch.Columns.Add(new DataGridViewTextBoxColumn { Name = "colResDate",  HeaderText = "Date",       FillWeight = 20 });
+            gridResearch.Columns.Add(new DataGridViewTextBoxColumn { Name = "colResCands", HeaderText = "Candidates", FillWeight = 15 });
+            // CellClick fires on every click regardless of whether selection changed —
+            // this is the reliable fallback when SelectionChanged doesn't fire.
+            gridResearch.CellClick += GridResearch_CellClick;
+            // NOTE: SelectionChanged is NOT registered here — it is registered
+            // inside RefreshResearchAsync after all Tags are set, to avoid the
+            // race where Rows.Add() fires the handler before Tag is populated.
 
-            // Middle: raw result viewer
-            var lblRaw = new Label { Text = "Raw Result", ForeColor = Color.Silver, AutoSize = true, Location = new Point(6, 214) };
-            txtResearchRaw = new TextBox
-            {
-                Location = new Point(6, 232), Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
-                Height = 100, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical,
-                BackColor = Color.FromArgb(40, 40, 40), ForeColor = Color.LightGray, Font = new Font("Consolas", 9f)
-            };
-
-            // Bottom: candidate notes checklist
-            var lblCands = new Label { Text = "Candidate Notes — check to promote:", ForeColor = Color.Silver, AutoSize = true, Location = new Point(6, 340) };
-            lstCandidates = new CheckedListBox
-            {
-                Location = new Point(6, 358), Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom,
-                Height = 180, BackColor = Color.FromArgb(45, 45, 45), ForeColor = Color.White, Font = new Font("Consolas", 9f)
-            };
-
-            int btnY = 546;
-            btnRefreshResearch = MakeButton("Refresh",          new Point(6, btnY),   new Size(110, 26)); btnRefreshResearch.Click += (_, _) => _ = RefreshResearchAsync();
-            btnPromoteResearch = MakeButton("Promote Selected", new Point(124, btnY), new Size(140, 26)); btnPromoteResearch.BackColor = Color.FromArgb(0, 120, 60); btnPromoteResearch.Click += (_, _) => _ = PromoteResearchAsync();
-            btnDiscardResearch = MakeButton("Discard",          new Point(272, btnY), new Size(100, 26)); btnDiscardResearch.BackColor = Color.DarkRed; btnDiscardResearch.Click += (_, _) => _ = DiscardResearchAsync();
-
-            tabResearch.Controls.AddRange(new Control[]
-            {
-                gridResearch, lblRaw, txtResearchRaw, lblCands, lstCandidates,
-                btnRefreshResearch, btnPromoteResearch, btnDiscardResearch
-            });
-
-            // Wire resize for controls that need it
-            tabResearch.Resize += (_, _) =>
-            {
-                int w = tabResearch.ClientSize.Width - 12;
-                gridResearch.Width = w;
-                txtResearchRaw.Width = w;
-                lstCandidates.Width = w;
-            };
+            // Add bottom-docked controls first (stack upward), then Fill grid last
+            tabResearch.Controls.Add(btnPanel);
+            tabResearch.Controls.Add(lstCandidates);
+            tabResearch.Controls.Add(lblCands);
+            tabResearch.Controls.Add(txtResearchRaw);
+            tabResearch.Controls.Add(lblRaw);
+            tabResearch.Controls.Add(gridResearch);
         }
 
         // ── Tab switching ─────────────────────────────────────────────────
@@ -338,9 +382,207 @@ namespace WindowsFormsApp
                 _ = RefreshDocProjectsAsync();
             else if (tabMain.SelectedTab == tabResearch)
                 _ = RefreshResearchAsync();
+            else if (tabMain.SelectedTab == tabTrace)
+                _ = RefreshTraceAsync();
+            else if (tabMain.SelectedTab == tabProjects)
+                _ = RefreshProjectGridAsync();
         }
 
-        // ── Projects ──────────────────────────────────────────────────────
+        // ── Projects tab ──────────────────────────────────────────────────
+
+        private void BuildProjectsTab()
+        {
+            tabProjects = new TabPage("Projects") { BackColor = Color.FromArgb(30, 30, 30), ForeColor = Color.White };
+
+            // ── Bottom editor panel (always visible, docked Bottom) ──────────
+            var bottomPanel = new Panel
+            {
+                Dock = DockStyle.Bottom,
+                Height = 112,
+                BackColor = Color.FromArgb(30, 30, 30),
+                Padding = new Padding(6, 4, 6, 4)
+            };
+
+            var lblName = new Label { Text = "Name",        ForeColor = Color.Silver, AutoSize = true, Location = new Point(6,   6) };
+            var lblDesc = new Label { Text = "Description", ForeColor = Color.Silver, AutoSize = true, Location = new Point(260, 6) };
+            var lblStat = new Label { Text = "Status",      ForeColor = Color.Silver, AutoSize = true, Location = new Point(740, 6) };
+
+            txtProjName = new TextBox
+            {
+                Location = new Point(6, 23), Size = new Size(246, 23),
+                BackColor = Color.FromArgb(55, 55, 55), ForeColor = Color.White
+            };
+            txtProjDesc = new TextBox
+            {
+                Location = new Point(260, 23), Size = new Size(472, 23),
+                BackColor = Color.FromArgb(55, 55, 55), ForeColor = Color.White
+            };
+            cmbProjStatus = new ComboBox
+            {
+                Location = new Point(740, 23), Size = new Size(120, 23),
+                BackColor = Color.FromArgb(55, 55, 55), ForeColor = Color.White,
+                DropDownStyle = ComboBoxStyle.DropDownList
+            };
+            cmbProjStatus.Items.AddRange(new object[] { "active", "archived" });
+            cmbProjStatus.SelectedIndex = 0;
+
+            var btnRefreshProj = MakeButton("Refresh",      new Point(6,   58), new Size(110, 26));
+            btnRefreshProj.Click += (_, _) => _ = RefreshProjectGridAsync();
+
+            btnNewProject = MakeButton("New Project",    new Point(124, 58), new Size(120, 26));
+            btnNewProject.BackColor = Color.FromArgb(0, 100, 60);
+            btnNewProject.Click += (_, _) => _ = CreateProjectAsync();
+
+            btnSaveProject = MakeButton("Save Changes",  new Point(252, 58), new Size(120, 26));
+            btnSaveProject.Click += (_, _) => _ = SaveProjectChangesAsync();
+
+            btnArchiveProject = MakeButton("Archive",    new Point(380, 58), new Size(100, 26));
+            btnArchiveProject.BackColor = Color.DarkGoldenrod;
+            btnArchiveProject.Click += (_, _) => _ = ArchiveProjectAsync();
+
+            bottomPanel.Controls.AddRange(new Control[]
+            {
+                lblName, txtProjName, lblDesc, txtProjDesc, lblStat, cmbProjStatus,
+                btnRefreshProj, btnNewProject, btnSaveProject, btnArchiveProject
+            });
+
+            // ── Grid (docked Fill — takes all remaining space above the panel) ──
+            gridProjects = new DataGridView
+            {
+                Dock = DockStyle.Fill,
+                BackgroundColor = Color.FromArgb(40, 40, 40),
+                ForeColor = Color.White,
+                ColumnHeadersDefaultCellStyle = { BackColor = Color.FromArgb(60, 60, 60), ForeColor = Color.White },
+                DefaultCellStyle = { BackColor = Color.FromArgb(45, 45, 45), ForeColor = Color.White, SelectionBackColor = Color.SteelBlue },
+                ReadOnly = true, SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+                MultiSelect = false, AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill
+            };
+            gridProjects.Columns.Add(new DataGridViewTextBoxColumn { Name = "colProjId",      HeaderText = "ID",          FillWeight = 10 });
+            gridProjects.Columns.Add(new DataGridViewTextBoxColumn { Name = "colProjName",    HeaderText = "Name",        FillWeight = 25 });
+            gridProjects.Columns.Add(new DataGridViewTextBoxColumn { Name = "colProjDesc",    HeaderText = "Description", FillWeight = 45 });
+            gridProjects.Columns.Add(new DataGridViewTextBoxColumn { Name = "colProjStatus",  HeaderText = "Status",      FillWeight = 10 });
+            gridProjects.Columns.Add(new DataGridViewTextBoxColumn { Name = "colProjCreated", HeaderText = "Created",     FillWeight = 10 });
+            gridProjects.Columns.Add(new DataGridViewTextBoxColumn { Name = "colProjUsed",    HeaderText = "Last Used",   FillWeight = 10 });
+            gridProjects.SelectionChanged += GridProjects_SelectionChanged;
+
+            // Add bottomPanel before gridProjects so docking resolves correctly
+            tabProjects.Controls.Add(bottomPanel);
+            tabProjects.Controls.Add(gridProjects);
+        }
+
+        private void TabMain_DrawItem(object? sender, DrawItemEventArgs e)
+        {
+            var tab = tabMain.TabPages[e.Index];
+            bool selected = e.Index == tabMain.SelectedIndex;
+            var bgColor = selected ? Color.FromArgb(55, 55, 55) : Color.FromArgb(35, 35, 35);
+            using var bg = new SolidBrush(bgColor);
+            e.Graphics.FillRectangle(bg, e.Bounds);
+            // Draw a subtle top accent line on the selected tab
+            if (selected)
+            {
+                using var accent = new Pen(Color.SteelBlue, 2);
+                e.Graphics.DrawLine(accent, e.Bounds.Left, e.Bounds.Top, e.Bounds.Right, e.Bounds.Top);
+            }
+            using var fg = new SolidBrush(selected ? Color.White : Color.Silver);
+            var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
+            e.Graphics.DrawString(tab.Text, e.Font ?? Font, fg,
+                RectangleF.FromLTRB(e.Bounds.Left, e.Bounds.Top, e.Bounds.Right, e.Bounds.Bottom), sf);
+        }
+
+        private void GridProjects_SelectionChanged(object? sender, EventArgs e)
+        {
+            if (gridProjects.SelectedRows.Count == 0) return;
+            var row = gridProjects.SelectedRows[0];
+            _selectedProjectId     = row.Cells["colProjId"].Value?.ToString()    ?? "";
+            txtProjName.Text       = row.Cells["colProjName"].Value?.ToString()  ?? "";
+            txtProjDesc.Text       = row.Cells["colProjDesc"].Value?.ToString()  ?? "";
+            cmbProjStatus.SelectedItem = row.Cells["colProjStatus"].Value?.ToString() ?? "active";
+        }
+
+        private async Task RefreshProjectGridAsync()
+        {
+            try
+            {
+                var json = await _http.GetStringAsync("projects");
+                using var doc = JsonDocument.Parse(json);
+                gridProjects.Rows.Clear();
+                foreach (var p in doc.RootElement.EnumerateArray())
+                {
+                    string id     = p.GetProperty("id").GetString()         ?? "";
+                    string name   = p.GetProperty("name").GetString()       ?? "";
+                    string desc   = p.TryGetProperty("description", out var dv) ? dv.GetString() ?? "" : "";
+                    string status = p.GetProperty("status").GetString()     ?? "";
+                    string ca     = p.GetProperty("created_at").GetString() ?? "";
+                    string lu     = p.TryGetProperty("last_used_at", out var luv) && luv.ValueKind != JsonValueKind.Null
+                                    ? luv.GetString() ?? "" : "";
+                    gridProjects.Rows.Add(id, name, desc, status,
+                        ca.Length >= 10 ? ca[..10] : ca,
+                        lu.Length >= 10 ? lu[..10] : lu);
+                }
+                await RefreshProjectsAsync(); // keep Memory + Documents sidebars in sync
+            }
+            catch (Exception ex) { ShowError(ex.Message); }
+        }
+
+        private async Task CreateProjectAsync()
+        {
+            string name = txtProjName.Text.Trim();
+            if (string.IsNullOrEmpty(name)) { ShowError("Enter a project name."); return; }
+            try
+            {
+                var body = JsonSerializer.Serialize(new { name, description = txtProjDesc.Text.Trim() });
+                var resp = await _http.PostAsync("projects",
+                    new StringContent(body, Encoding.UTF8, "application/json"));
+                resp.EnsureSuccessStatusCode();
+                txtProjName.Clear();
+                txtProjDesc.Clear();
+                await RefreshProjectGridAsync();
+                ProjectsChanged?.Invoke(this, EventArgs.Empty);
+            }
+            catch (Exception ex) { ShowError(ex.Message); }
+        }
+
+        private async Task SaveProjectChangesAsync()
+        {
+            if (string.IsNullOrEmpty(_selectedProjectId)) return;
+            try
+            {
+                var body = JsonSerializer.Serialize(new
+                {
+                    name        = txtProjName.Text.Trim(),
+                    description = txtProjDesc.Text.Trim(),
+                    status      = cmbProjStatus.SelectedItem?.ToString() ?? "active",
+                });
+                var resp = await _http.PatchAsync($"projects/{_selectedProjectId}",
+                    new StringContent(body, Encoding.UTF8, "application/json"));
+                resp.EnsureSuccessStatusCode();
+                await RefreshProjectGridAsync();
+                ProjectsChanged?.Invoke(this, EventArgs.Empty);
+            }
+            catch (Exception ex) { ShowError(ex.Message); }
+        }
+
+        private async Task ArchiveProjectAsync()
+        {
+            if (string.IsNullOrEmpty(_selectedProjectId)) return;
+            string name = gridProjects.SelectedRows.Count > 0
+                ? gridProjects.SelectedRows[0].Cells["colProjName"].Value?.ToString() ?? _selectedProjectId
+                : _selectedProjectId;
+            if (MessageBox.Show($"Archive project '{name}'?\n\nData is preserved; it will no longer appear in client dropdowns.",
+                    "Confirm Archive", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+            try
+            {
+                var body = JsonSerializer.Serialize(new { status = "archived" });
+                var resp = await _http.PatchAsync($"projects/{_selectedProjectId}",
+                    new StringContent(body, Encoding.UTF8, "application/json"));
+                resp.EnsureSuccessStatusCode();
+                await RefreshProjectGridAsync();
+                ProjectsChanged?.Invoke(this, EventArgs.Empty);
+            }
+            catch (Exception ex) { ShowError(ex.Message); }
+        }
+
+        // ── Sidebar project lists (Memory + Documents tabs) ────────────────
 
         private async Task RefreshProjectsAsync()
         {
@@ -504,10 +746,101 @@ namespace WindowsFormsApp
             {
                 var json = await _http.GetStringAsync($"debug/last-context?session_id={Uri.EscapeDataString(_callerSessionId)}");
                 using var doc = JsonDocument.Parse(json);
-                var sb = new StringBuilder();
-                sb.AppendLine($"Context debug for session: {_callerSessionId}");
-                sb.AppendLine(new string('─', 60));
-                sb.AppendLine(doc.RootElement.ToString());
+                var root = doc.RootElement;
+                var sb   = new StringBuilder();
+
+                sb.AppendLine($"Context debug  session: {_callerSessionId}");
+                sb.AppendLine(new string('═', 64));
+                sb.AppendLine();
+
+                // Budget summary row
+                if (root.TryGetProperty("max_context_tokens", out var maxTok))
+                    sb.AppendLine($"  max_context_tokens : {maxTok}");
+                if (root.TryGetProperty("budget", out var bgt))
+                {
+                    sb.Append("  budgets            :");
+                    foreach (var kv in bgt.EnumerateObject())
+                        sb.Append($"  {kv.Name}={kv.Value}");
+                    sb.AppendLine();
+                }
+                sb.AppendLine();
+
+                // Render a note list embedded within a layer
+                void RenderNotes(JsonElement layer)
+                {
+                    if (!layer.TryGetProperty("notes", out var notes) ||
+                        notes.ValueKind != JsonValueKind.Array) return;
+                    foreach (var note in notes.EnumerateArray())
+                    {
+                        var id      = note.TryGetProperty("id",      out var vi) ? vi.GetString() ?? "" : "";
+                        var scope   = note.TryGetProperty("scope",   out var vs) ? vs.GetString() ?? "" : "";
+                        var preview = note.TryGetProperty("preview", out var vp) ? vp.GetString() ?? "" : "";
+                        var shortId = id.Length >= 8 ? id[..8] : id;
+                        sb.AppendLine($"  [{scope}] {shortId}…  {preview}");
+                    }
+                }
+
+                void RenderLayer(string key, string header)
+                {
+                    if (!root.TryGetProperty(key, out var layer)) return;
+                    sb.AppendLine($"━━ {header}");
+
+                    // Token + count summary on one line
+                    if (layer.TryGetProperty("tokens", out var tok))
+                        sb.Append($"  tokens: {tok}");
+                    if (layer.TryGetProperty("count", out var cnt))
+                    {
+                        sb.Append($"    notes: {cnt}");
+                        if (layer.TryGetProperty("injected_count", out var ic) &&
+                            ic.GetInt32() != cnt.GetInt32())
+                        {
+                            var fa = layer.TryGetProperty("filter_applied", out var fav)
+                                     ? fav.GetString() : "?";
+                            sb.Append($" → {ic} injected ({fa} filter)");
+                        }
+                    }
+                    if (layer.TryGetProperty("messages", out var msgs))
+                        sb.Append($"    messages: {msgs}");
+                    sb.AppendLine();
+
+                    if (layer.TryGetProperty("name", out var pname))
+                        sb.AppendLine($"  project: {pname}");
+
+                    RenderNotes(layer);
+
+                    // Document-chunk retrieval hits
+                    if (layer.TryGetProperty("hits", out var hits) &&
+                        hits.ValueKind == JsonValueKind.Array)
+                    {
+                        foreach (var hit in hits.EnumerateArray())
+                        {
+                            var src   = hit.TryGetProperty("source", out var sv) ? sv.GetString() ?? "" : "";
+                            var score = hit.TryGetProperty("score",  out var sc)
+                                        ? sc.GetDouble().ToString("F3") : "?";
+                            sb.AppendLine($"  score={score}  {src}");
+                        }
+                    }
+
+                    // Grounding block meta
+                    if (layer.TryGetProperty("injected", out var inj))
+                        sb.AppendLine($"  injected: {inj}");
+                    if (layer.TryGetProperty("project", out var gproj) &&
+                        !layer.TryGetProperty("name", out _))
+                        sb.AppendLine($"  project:  {gproj}");
+
+                    sb.AppendLine();
+                }
+
+                RenderLayer("system",       "[1] SYSTEM IDENTITY");
+                RenderLayer("operator",     "[2] OPERATOR NOTES");
+                RenderLayer("project",      "[3] PROJECT NOTES + RESEARCH");
+                RenderLayer("grounding",    "[GROUNDING RULES]");
+                RenderLayer("global",       "[4] GLOBAL MEMORY");
+                RenderLayer("retrieval",    "[5] RETRIEVED CHUNKS (doc search)");
+                RenderLayer("summary",      "[6] SESSION SUMMARY");
+                RenderLayer("conversation", "[7] RECENT CONVERSATION");
+                RenderLayer("prompt",       "[8] CURRENT PROMPT");
+
                 ShowTextViewer("Last Context — Layer Breakdown", sb.ToString());
             }
             catch (HttpRequestException ex) when (ex.Message.Contains("404"))
@@ -628,6 +961,10 @@ namespace WindowsFormsApp
             {
                 var json = await _http.GetStringAsync("research/pending");
                 using var doc = JsonDocument.Parse(json);
+
+                // Detach handler before bulk Add — Rows.Add() fires SelectionChanged
+                // before we can set Tag on the next line, leaving Tag=null in the handler.
+                gridResearch.SelectionChanged -= GridResearch_SelectionChanged;
                 gridResearch.Rows.Clear();
                 _candidateNotes.Clear();
                 lstCandidates.Items.Clear();
@@ -640,43 +977,114 @@ namespace WindowsFormsApp
                     int cands    = item.TryGetProperty("candidate_notes", out var cn) && cn.ValueKind == JsonValueKind.Array
                                    ? cn.GetArrayLength() : 0;
                     int row = gridResearch.Rows.Add(id, query, date, cands);
-                    gridResearch.Rows[row].Tag = item.GetRawText();
+                    gridResearch.Rows[row].Tag = item.GetRawText();   // Tag set before handler re-hooks
                 }
+                gridResearch.SelectionChanged += GridResearch_SelectionChanged;
+                // Call directly — do NOT rely on SelectionChanged firing here.
+                // After Rows.Add() the grid may have already auto-selected row 0 while
+                // the handler was detached, so setting Selected=true again is a no-op.
+                if (gridResearch.Rows.Count > 0)
+                    LoadResearchRowDetails(gridResearch.Rows[0]);
             }
             catch (Exception ex) { ShowError(ex.Message); }
         }
 
-        private void GridResearch_SelectionChanged(object? sender, EventArgs e)
+        /// <summary>Populate Raw Result and Candidate Notes from the given grid row's Tag.</summary>
+        private void LoadResearchRowDetails(DataGridViewRow row)
         {
-            if (gridResearch.SelectedRows.Count == 0) return;
-            string rawJson = gridResearch.SelectedRows[0].Tag as string ?? "";
-            _selectedResearchId = gridResearch.SelectedRows[0].Cells["colResId"].Value?.ToString() ?? "";
+            Debug.WriteLine($"[ResearchTab] LoadResearchRowDetails called. Row index={row.Index}");
+
+            string rawJson = row.Tag as string ?? "";
+            Debug.WriteLine($"[ResearchTab] Tag is {(row.Tag == null ? "NULL" : $"string, length={rawJson.Length}")}");
+            Debug.WriteLine($"[ResearchTab] Tag preview: {rawJson[..Math.Min(200, rawJson.Length)]}");
+
+            _selectedResearchId = row.Cells["colResId"].Value?.ToString() ?? "";
+            Debug.WriteLine($"[ResearchTab] _selectedResearchId={_selectedResearchId}");
+
             _candidateNotes.Clear();
             lstCandidates.Items.Clear();
             txtResearchRaw.Clear();
+
+            if (string.IsNullOrEmpty(rawJson))
+            {
+                Debug.WriteLine("[ResearchTab] rawJson is empty — aborting detail load");
+                txtResearchRaw.Text = "[DEBUG] Tag was null/empty when row was selected. Try clicking Refresh.";
+                return;
+            }
+
             try
             {
                 using var doc = JsonDocument.Parse(rawJson);
-                txtResearchRaw.Text = doc.RootElement.TryGetProperty("raw_result", out var rr)
-                    ? rr.GetString() ?? "" : "";
+                Debug.WriteLine("[ResearchTab] JSON parsed OK");
 
-                if (doc.RootElement.TryGetProperty("candidate_notes", out var cands)
-                    && cands.ValueKind == JsonValueKind.Array)
+                bool hasRaw = doc.RootElement.TryGetProperty("raw_result", out var rr);
+                Debug.WriteLine($"[ResearchTab] has raw_result={hasRaw}, ValueKind={rr.ValueKind}");
+                txtResearchRaw.Text = hasRaw ? rr.GetString() ?? "" : "";
+                Debug.WriteLine($"[ResearchTab] txtResearchRaw.Text length={txtResearchRaw.Text.Length}");
+
+                bool hasCands = doc.RootElement.TryGetProperty("candidate_notes", out var cands);
+                Debug.WriteLine($"[ResearchTab] has candidate_notes={hasCands}, ValueKind={cands.ValueKind}");
+                if (hasCands && cands.ValueKind == JsonValueKind.Array)
                 {
+                    int i = 0;
                     foreach (var c in cands.EnumerateArray())
                     {
-                        string content = c.TryGetProperty("content", out var cv) ? cv.GetString() ?? "" : "";
-                        string scope   = c.TryGetProperty("scope",   out var sv) ? sv.GetString() ?? "global" : "global";
-                        string tags    = c.TryGetProperty("tags",    out var tv) ? tv.GetString() ?? "" : "";
-                        _candidateNotes.Add(new Dictionary<string, object>
+                        string content     = c.TryGetProperty("content",      out var cv)  ? cv.GetString()  ?? "" : "";
+                        string scope       = c.TryGetProperty("scope",        out var sv)  ? sv.GetString()  ?? "global" : "global";
+                        string tags        = c.TryGetProperty("tags",         out var tv)  ? tv.GetString()  ?? "" : "";
+                        string game        = c.TryGetProperty("game",         out var gmv) ? gmv.GetString() ?? "" : "";
+                        string entityClass = c.TryGetProperty("entity_class", out var ecv) ? ecv.GetString() ?? "" : "";
+                        string buildTopic  = c.TryGetProperty("build_topic",  out var btv) ? btv.GetString() ?? "" : "";
+                        string season      = c.TryGetProperty("season",       out var snv) ? snv.GetString() ?? "" : "";
+                        string noteType    = c.TryGetProperty("note_type",    out var ntv) ? ntv.GetString() ?? "" : "";
+                        bool   patchSens   = c.TryGetProperty("patch_sensitive", out var psv) && psv.GetBoolean();
+
+                        // Preserve all fields so they survive the promote round-trip
+                        var noteDict = new Dictionary<string, object>
                         {
-                            ["content"] = content, ["scope"] = scope, ["tags"] = tags, ["state"] = "durable"
-                        });
-                        lstCandidates.Items.Add($"[{scope}] {content}", true);
+                            ["content"]       = content,
+                            ["scope"]         = scope,
+                            ["tags"]          = tags,
+                            ["state"]         = "durable",
+                            ["game"]          = game,
+                            ["entity_class"]  = entityClass,
+                            ["build_topic"]   = buildTopic,
+                            ["season"]        = season,
+                            ["note_type"]     = noteType,
+                            ["patch_sensitive"] = patchSens,
+                        };
+                        _candidateNotes.Add(noteDict);
+
+                        // Build display label: [scope] [Game | Class | Build | Season] content…
+                        var anchors = new[] { game, entityClass, buildTopic, season }
+                            .Where(s => !string.IsNullOrEmpty(s));
+                        string anchorStr = anchors.Any() ? $"[{string.Join(" | ", anchors)}] " : "";
+                        string preview   = content.Length > 80 ? content[..80] + "…" : content;
+                        lstCandidates.Items.Add($"[{scope}] {anchorStr}{preview}", true);
+                        Debug.WriteLine($"[ResearchTab]   candidate[{i++}]: scope={scope} anchors={anchorStr} content={content[..Math.Min(60, content.Length)]}");
                     }
+                    Debug.WriteLine($"[ResearchTab] Total candidates loaded: {_candidateNotes.Count}");
                 }
             }
-            catch { /* malformed JSON — leave empty */ }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[ResearchTab] JSON parse EXCEPTION: {ex.Message}");
+                txtResearchRaw.Text = $"[DEBUG] JSON parse failed: {ex.Message}\n\nRaw Tag (first 500):\n{rawJson[..Math.Min(500, rawJson.Length)]}";
+            }
+        }
+
+        private void GridResearch_SelectionChanged(object? sender, EventArgs e)
+        {
+            Debug.WriteLine($"[ResearchTab] SelectionChanged fired. SelectedRows.Count={gridResearch.SelectedRows.Count}");
+            if (gridResearch.SelectedRows.Count == 0) return;
+            LoadResearchRowDetails(gridResearch.SelectedRows[0]);
+        }
+
+        private void GridResearch_CellClick(object? sender, DataGridViewCellEventArgs e)
+        {
+            Debug.WriteLine($"[ResearchTab] CellClick fired. RowIndex={e.RowIndex}");
+            if (e.RowIndex < 0 || e.RowIndex >= gridResearch.Rows.Count) return;
+            LoadResearchRowDetails(gridResearch.Rows[e.RowIndex]);
         }
 
         private async Task PromoteResearchAsync()
@@ -711,6 +1119,232 @@ namespace WindowsFormsApp
             {
                 await _http.DeleteAsync($"research/{_selectedResearchId}");
                 await RefreshResearchAsync();
+            }
+            catch (Exception ex) { ShowError(ex.Message); }
+        }
+
+        // ── Research Trace tab ────────────────────────────────────────────
+
+        private void BuildTraceTab()
+        {
+            tabTrace = new TabPage("Research Trace") { BackColor = Color.FromArgb(30, 30, 30), ForeColor = Color.White };
+
+            var btnPanel = new Panel
+            {
+                Dock = DockStyle.Bottom, Height = 36,
+                BackColor = Color.FromArgb(30, 30, 30), Padding = new Padding(6, 5, 6, 5)
+            };
+            btnRefreshTrace = MakeButton("Refresh", new Point(0, 4), new Size(110, 26));
+            btnRefreshTrace.Click += (_, _) => _ = RefreshTraceAsync();
+            var btnViewRaw = MakeButton("View Full Result", new Point(118, 4), new Size(140, 26));
+            btnViewRaw.Click += (_, _) => _ = ViewTraceRawAsync();
+            btnPanel.Controls.AddRange(new Control[] { btnRefreshTrace, btnViewRaw });
+
+            txtTraceDetail = new TextBox
+            {
+                Dock = DockStyle.Bottom, Height = 260,
+                Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical,
+                BackColor = Color.FromArgb(40, 40, 40), ForeColor = Color.LightGray,
+                Font = new Font("Consolas", 9f), WordWrap = false
+            };
+            var lblDetail = new Label
+            {
+                Text = "Trace Detail:", ForeColor = Color.Silver,
+                Dock = DockStyle.Bottom, Height = 18, TextAlign = ContentAlignment.BottomLeft,
+                Padding = new Padding(6, 0, 0, 0)
+            };
+
+            gridTrace = new DataGridView
+            {
+                Dock = DockStyle.Fill,
+                BackgroundColor = Color.FromArgb(40, 40, 40), ForeColor = Color.White,
+                ColumnHeadersDefaultCellStyle = { BackColor = Color.FromArgb(60, 60, 60), ForeColor = Color.White },
+                DefaultCellStyle = { BackColor = Color.FromArgb(45, 45, 45), ForeColor = Color.White, SelectionBackColor = Color.SteelBlue },
+                ReadOnly = true, SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+                MultiSelect = false, AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill
+            };
+            gridTrace.Columns.Add(new DataGridViewTextBoxColumn { Name = "colTrDate",   HeaderText = "Date",       FillWeight = 16 });
+            gridTrace.Columns.Add(new DataGridViewTextBoxColumn { Name = "colTrState",  HeaderText = "State",      FillWeight = 10 });
+            gridTrace.Columns.Add(new DataGridViewTextBoxColumn { Name = "colTrModel",  HeaderText = "Model",      FillWeight = 14 });
+            gridTrace.Columns.Add(new DataGridViewTextBoxColumn { Name = "colTrTopic",  HeaderText = "Topic",      FillWeight = 40 });
+            gridTrace.Columns.Add(new DataGridViewTextBoxColumn { Name = "colTrQCount", HeaderText = "Queries",    FillWeight = 8  });
+            gridTrace.Columns.Add(new DataGridViewTextBoxColumn { Name = "colTrSCount", HeaderText = "Sources",    FillWeight = 8  });
+            gridTrace.Columns.Add(new DataGridViewTextBoxColumn { Name = "colTrCCount", HeaderText = "Candidates", FillWeight = 8  });
+            gridTrace.CellClick       += GridTrace_CellClick;
+            gridTrace.SelectionChanged += GridTrace_SelectionChanged;
+
+            // Bottom-docked controls stack upward; Fill grid takes remaining space
+            tabTrace.Controls.Add(btnPanel);
+            tabTrace.Controls.Add(txtTraceDetail);
+            tabTrace.Controls.Add(lblDetail);
+            tabTrace.Controls.Add(gridTrace);
+        }
+
+        private async Task RefreshTraceAsync()
+        {
+            try
+            {
+                var json = await _http.GetStringAsync("research/recent");
+                using var doc = JsonDocument.Parse(json);
+                gridTrace.SelectionChanged -= GridTrace_SelectionChanged;
+                gridTrace.Rows.Clear();
+                txtTraceDetail.Clear();
+                foreach (var item in doc.RootElement.EnumerateArray())
+                {
+                    string id    = item.TryGetProperty("id",         out var idv)  ? idv.GetString()  ?? "" : "";
+                    string state = item.TryGetProperty("state",      out var sv)   ? sv.GetString()   ?? "" : "";
+                    string model = item.TryGetProperty("model",      out var mv)   && mv.ValueKind != JsonValueKind.Null ? mv.GetString() ?? "" : "";
+                    string ca    = item.TryGetProperty("created_at", out var cav)  ? cav.GetString()  ?? "" : "";
+                    string date  = ca.Length >= 16 ? ca[..16] : ca;
+
+                    string topic  = "";
+                    int qCount = 0, sCount = 0, cCount = 0;
+                    if (item.TryGetProperty("trace_json", out var tj) && tj.ValueKind == JsonValueKind.Object)
+                    {
+                        topic  = tj.TryGetProperty("topic",           out var tpv) ? tpv.GetString() ?? "" : "";
+                        qCount = tj.TryGetProperty("query_count",     out var qcv) ? qcv.GetInt32() : 0;
+                        sCount = tj.TryGetProperty("source_count",    out var scv) ? scv.GetInt32() : 0;
+                        cCount = tj.TryGetProperty("candidate_count", out var ccv) ? ccv.GetInt32() : 0;
+                    }
+                    if (string.IsNullOrEmpty(topic) && item.TryGetProperty("query", out var qv))
+                        topic = qv.GetString() ?? "";
+
+                    int row = gridTrace.Rows.Add(date, state, model, topic, qCount, sCount, cCount);
+                    gridTrace.Rows[row].Tag = new TraceRowData(id, item.GetRawText());
+                }
+                gridTrace.SelectionChanged += GridTrace_SelectionChanged;
+                if (gridTrace.Rows.Count > 0)
+                    ShowTraceDetail(gridTrace.Rows[0]);
+            }
+            catch (Exception ex) { ShowError(ex.Message); }
+        }
+
+        private void ShowTraceDetail(DataGridViewRow row)
+        {
+            _selectedTraceId = "";
+            txtTraceDetail.Clear();
+            if (row.Tag is not TraceRowData entry) return;
+            _selectedTraceId = entry.Id;
+            try
+            {
+                using var doc = JsonDocument.Parse(entry.RawJson);
+                var root = doc.RootElement;
+                string state  = root.TryGetProperty("state",      out var sv)  ? sv.GetString()  ?? "" : "";
+                string model  = root.TryGetProperty("model",      out var mv)  && mv.ValueKind != JsonValueKind.Null ? mv.GetString() ?? "(unknown)" : "(unknown)";
+                string ca     = root.TryGetProperty("created_at", out var cav) ? cav.GetString() ?? "" : "";
+                string prompt = root.TryGetProperty("query",      out var prv) ? prv.GetString() ?? "" : "";
+
+                var sb = new StringBuilder();
+                sb.AppendLine(new string('=', 64));
+                sb.AppendLine($"RESEARCH TRACE — {ca}");
+                sb.AppendLine($"State: {state}  |  Model: {model}");
+                sb.AppendLine(new string('=', 64));
+                sb.AppendLine();
+                sb.AppendLine("ORIGINAL PROMPT:");
+                sb.AppendLine($"  {prompt}");
+                sb.AppendLine();
+
+                if (root.TryGetProperty("trace_json", out var tj) && tj.ValueKind == JsonValueKind.Object)
+                {
+                    string topic = tj.TryGetProperty("topic", out var tpv) ? tpv.GetString() ?? "" : "";
+                    sb.AppendLine("TOPIC:");
+                    sb.AppendLine($"  {topic}");
+                    sb.AppendLine();
+
+                    if (tj.TryGetProperty("entity_interpretations", out var ei) && ei.ValueKind == JsonValueKind.Array)
+                    {
+                        var interpLines = new List<string>();
+                        foreach (var interp in ei.EnumerateArray())
+                        {
+                            string orig = interp.TryGetProperty("original",   out var ov) ? ov.GetString() ?? "" : "";
+                            string used = interp.TryGetProperty("used_as",    out var uv) ? uv.GetString() ?? "" : "";
+                            double conf = interp.TryGetProperty("confidence", out var cv) && cv.ValueKind != JsonValueKind.Null ? cv.GetDouble() : 1.0;
+                            if (!string.IsNullOrEmpty(orig) && !string.IsNullOrEmpty(used)
+                                && !orig.Equals(used, StringComparison.OrdinalIgnoreCase))
+                            {
+                                string flag = conf < 0.8 ? "⚠" : "ℹ";
+                                interpLines.Add($"  {flag} '{orig}' → '{used}' ({conf:P0} confidence)");
+                            }
+                        }
+                        if (interpLines.Count > 0)
+                        {
+                            sb.AppendLine("ENTITY INTERPRETATIONS:");
+                            foreach (var l in interpLines) sb.AppendLine(l);
+                            sb.AppendLine();
+                        }
+                    }
+
+                    if (tj.TryGetProperty("queries", out var qs) && qs.ValueKind == JsonValueKind.Array)
+                    {
+                        int qCount = tj.TryGetProperty("query_count", out var qcv) ? qcv.GetInt32() : qs.GetArrayLength();
+                        sb.AppendLine($"GENERATED QUERIES ({qCount}):");
+                        int i = 1;
+                        foreach (var q in qs.EnumerateArray())
+                            sb.AppendLine($"  {i++}. {q.GetString()}");
+                        sb.AppendLine();
+                    }
+
+                    if (tj.TryGetProperty("sources", out var srcs) && srcs.ValueKind == JsonValueKind.Array)
+                    {
+                        int sCount = tj.TryGetProperty("source_count",  out var scv) ? scv.GetInt32() : srcs.GetArrayLength();
+                        int aCount = tj.TryGetProperty("answers_count", out var acv) ? acv.GetInt32() : 0;
+                        sb.AppendLine($"SOURCES ({sCount} unique{(aCount > 0 ? $", {aCount} inline answer(s)" : "")}):");
+                        foreach (var s in srcs.EnumerateArray())
+                        {
+                            string title = s.TryGetProperty("title",    out var ttv)  ? ttv.GetString()  ?? "?" : "?";
+                            string url   = s.TryGetProperty("url",      out var urlv) ? urlv.GetString() ?? ""  : "";
+                            string subq  = s.TryGetProperty("subquery", out var sqv)  ? sqv.GetString()  ?? ""  : "";
+                            string subqS = subq.Length > 58 ? subq[..58] + "…" : subq;
+                            sb.AppendLine($"  [{title}]");
+                            sb.AppendLine($"    {url}");
+                            if (!string.IsNullOrEmpty(subq))
+                                sb.AppendLine($"    via: \"{subqS}\"");
+                        }
+                        sb.AppendLine();
+                    }
+
+                    int synthLen = tj.TryGetProperty("synthesis_length", out var slv)  ? slv.GetInt32() : 0;
+                    int cands    = tj.TryGetProperty("candidate_count",  out var ccv2) ? ccv2.GetInt32() : 0;
+                    sb.AppendLine($"SYNTHESIS: {synthLen:#,0} chars  |  CANDIDATES: {cands}");
+                }
+                else
+                {
+                    sb.AppendLine("(No structured trace — this run predates the Research Trace feature)");
+                    sb.AppendLine("Use 'View Full Result' to see the raw synthesis text.");
+                }
+
+                txtTraceDetail.Text = sb.ToString();
+            }
+            catch (Exception ex)
+            {
+                txtTraceDetail.Text = $"Failed to parse trace: {ex.Message}";
+            }
+        }
+
+        private void GridTrace_SelectionChanged(object? sender, EventArgs e)
+        {
+            if (gridTrace.SelectedRows.Count == 0) return;
+            ShowTraceDetail(gridTrace.SelectedRows[0]);
+        }
+
+        private void GridTrace_CellClick(object? sender, DataGridViewCellEventArgs e)
+        {
+            if (e.RowIndex < 0 || e.RowIndex >= gridTrace.Rows.Count) return;
+            ShowTraceDetail(gridTrace.Rows[e.RowIndex]);
+        }
+
+        private async Task ViewTraceRawAsync()
+        {
+            if (string.IsNullOrEmpty(_selectedTraceId)) return;
+            try
+            {
+                var json = await _http.GetStringAsync($"research/{_selectedTraceId}/trace");
+                using var doc = JsonDocument.Parse(json);
+                string raw = doc.RootElement.TryGetProperty("raw_result", out var rv)
+                             ? rv.GetString() ?? "(empty)"
+                             : "(no raw_result in response)";
+                string shortId = _selectedTraceId.Length >= 8 ? _selectedTraceId[..8] : _selectedTraceId;
+                ShowTextViewer($"Research Result — {shortId}…", raw);
             }
             catch (Exception ex) { ShowError(ex.Message); }
         }
@@ -755,5 +1389,6 @@ namespace WindowsFormsApp
         {
             public override string ToString() => Name;
         }
+        private record TraceRowData(string Id, string RawJson);
     }
 }
