@@ -17,6 +17,17 @@ namespace WindowsFormsApp
             {
                 this.components.Dispose();
             }
+            if (disposing)
+            {
+                _mdDefault?.Dispose();
+                _mdBold?.Dispose();
+                _mdItalic?.Dispose();
+                _mdBoldItalic?.Dispose();
+                _mdCode?.Dispose();
+                _mdH1?.Dispose();
+                _mdH2?.Dispose();
+                _mdH3?.Dispose();
+            }
             base.Dispose(disposing);
         }
 
@@ -30,7 +41,8 @@ namespace WindowsFormsApp
         {
             txtPrompt = new TextBox();
             btnSend = new Button();
-            txtStream = new TextBox();
+            btnNewSession = new Button();
+            txtStream = new RichTextBox();
             cmbModel = new ComboBox();
             pnlControls = new Panel();
             label2 = new Label();
@@ -53,6 +65,16 @@ namespace WindowsFormsApp
             txtPrompt.TabIndex = 0;
             txtPrompt.TextChanged += TxtPrompt_TextChanged;
             // 
+            // btnNewSession
+            // 
+            btnNewSession.Location = new Point(10, 26);
+            btnNewSession.Name = "btnNewSession";
+            btnNewSession.Size = new Size(110, 26);
+            btnNewSession.TabIndex = 8;
+            btnNewSession.Text = "New Session";
+            btnNewSession.UseVisualStyleBackColor = true;
+            btnNewSession.Click += BtnNewSession_Click;
+            // 
             // btnSend
             // 
             btnSend.BackColor = Color.FromArgb(128, 255, 128);
@@ -68,15 +90,14 @@ namespace WindowsFormsApp
             // 
             // txtStream
             // 
-            txtStream.AccessibleRole = AccessibleRole.None;
             txtStream.Dock = DockStyle.Fill;
+            txtStream.DetectUrls = false;
             txtStream.Font = new Font("Segoe UI Emoji", 12F, FontStyle.Regular, GraphicsUnit.Point, 0);
             txtStream.Location = new Point(0, 55);
             txtStream.Margin = new Padding(4, 3, 4, 3);
-            txtStream.Multiline = true;
             txtStream.Name = "txtStream";
             txtStream.ReadOnly = true;
-            txtStream.ScrollBars = ScrollBars.Vertical;
+            txtStream.ScrollBars = RichTextBoxScrollBars.Vertical;
             txtStream.Size = new Size(933, 294);
             txtStream.TabIndex = 2;
             // 
@@ -96,6 +117,7 @@ namespace WindowsFormsApp
             pnlControls.Controls.Add(label1);
             pnlControls.Controls.Add(cmbModel);
             pnlControls.Controls.Add(btnSend);
+            pnlControls.Controls.Add(btnNewSession);
             pnlControls.Dock = DockStyle.Bottom;
             pnlControls.Location = new Point(0, 449);
             pnlControls.Name = "pnlControls";
@@ -174,9 +196,10 @@ namespace WindowsFormsApp
 
         #endregion
 
+        private System.Windows.Forms.Button btnNewSession;
+        private System.Windows.Forms.RichTextBox txtStream;
         private System.Windows.Forms.TextBox txtPrompt;
         private System.Windows.Forms.Button btnSend;
-        private System.Windows.Forms.TextBox txtStream;
         private ComboBox cmbModel;
         private Panel pnlControls;
         private Label label2;

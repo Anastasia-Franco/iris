@@ -57,6 +57,7 @@ Current hardware:
 - 128GB unified memory
 - 32-core processing environment
 - high-speed NVMe storage
+- 96GB 
 
 ## MSI Workstation
 Primary user interaction and orchestration workstation.

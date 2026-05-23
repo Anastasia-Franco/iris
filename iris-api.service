@@ -1,0 +1,38 @@
+[Unit]
+Description=IRIS API Server
+Documentation=https://github.com/yourusername/iris
+After=network.target ollama.service
+Wants=ollama.service
+
+[Service]
+Type=simple
+User=iris
+Group=iris
+WorkingDirectory=/opt/iris
+
+# Override these in /etc/systemd/system/iris-api.service.d/override.conf
+Environment="IRIS_DB_PATH=/opt/iris/data/iris_memory.db"
+Environment="IRIS_OLLAMA_HOST=http://127.0.0.1:11434"
+Environment="IRIS_DEFAULT_MODEL=qwen3:30b"
+EnvironmentFile=-/opt/iris/.env
+
+ExecStart=/opt/iris/venv/bin/uvicorn iris_server:app \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --workers 1 \
+    --log-level info
+
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=iris-api
+
+# Harden the service
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/iris/data
+
+[Install]
+WantedBy=multi-user.target

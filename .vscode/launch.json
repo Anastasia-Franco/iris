@@ -1,0 +1,16 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug IRIS",
+            "type": "coreclr",
+            "request": "launch",
+            "preLaunchTask": "build",
+            "program": "${workspaceFolder}/WindowsFormsApp/bin/Debug/net8.0-windows/WindowsFormsApp.exe",
+            "args": [],
+            "cwd": "${workspaceFolder}/WindowsFormsApp",
+            "stopAtEntry": false,
+            "console": "internalConsole"
+        }
+    ]
+}
