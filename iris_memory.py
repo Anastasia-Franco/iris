@@ -16,12 +16,8 @@ from datetime import datetime, timezone
 DEFAULT_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "iris_memory.db")
 
 _DEFAULT_PROJECTS = [
-    ("IRIS",                 "Core system development and infrastructure"),
-    ("CR Infrastructure",   "Correctional reform infrastructure projects"),
-    ("ALF Services",         "ALF service coordination and management"),
-    ("Abolition Inc",        "Abolition Inc organizational work"),
-    ("Prison Correspondence","Prison correspondence and communication projects"),
-    ("Hardware Lab",         "Hardware research, configuration, and lab work"),
+    ("IRIS", "Core system development and infrastructure"),
+    ("Hardware Lab", "Hardware research, configuration, and lab work"),
 ]
 
 

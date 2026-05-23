@@ -33,6 +33,7 @@ uploads/
 
 # Private documents
 docs/private/
+.iris_memory.py
 
 # OS junk
 .DS_Store
