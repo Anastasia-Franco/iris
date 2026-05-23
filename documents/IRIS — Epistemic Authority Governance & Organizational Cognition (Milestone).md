@@ -401,6 +401,101 @@ far better than synthetic benchmarks.
 
 ---
 
+# Global Guidance & Shared Cognition Layer
+
+Another major architectural realization emerged during live usage:
+
+Not all cognition belongs to:
+- project memory
+- retrieval corpora
+- research synthesis
+
+Some knowledge is cross-project behavioral guidance.
+
+Examples include:
+- communication framing
+- tone moderation
+- relational softening
+- collective organizational language
+- operator-specific communication tendencies
+- anti-abrasiveness translation
+- organizational interaction norms
+
+This led to the realization that IRIS requires a distinct:
+
+```text
+Global Guidance Layer
+```
+
+separate from:
+- project-scoped cognition
+- retrieval substrate
+- durable project memory
+- session reasoning
+
+The emerging architecture now resembles:
+
+```text
+Global Guidance Layer
+- communication norms
+- behavioral guidance
+- organizational framing
+- tone adaptation
+- operator interaction constraints
+
+Project Cognition Layer
+- project memory
+- retrieval corpora
+- durable synthesis
+- authority-weighted organizational reasoning
+
+Session Layer
+- temporary context
+- active reasoning
+- working cognition
+```
+
+This also motivated support for:
+
+```text
+global/shared documents
+```
+
+using:
+```text
+project_id = NULL
+```
+
+rather than forcing every document into a project container.
+
+Global documents are intended to provide:
+- cross-project guidance
+- organizational continuity
+- operator communication normalization
+- reusable behavioral/contextual framing
+
+without contaminating:
+- project-specific retrieval
+- durable organizational cognition
+- research synthesis boundaries
+
+This distinction further reinforced the principle:
+
+```text
+documents are reusable cognition assets,
+not merely uploaded files
+```
+
+and pushed IRIS further toward becoming:
+
+```text
+a governed longitudinal cognition environment
+```
+
+rather than a simple retrieval interface.
+
+---
+
 # Current IRIS Identity
 
 IRIS is now evolving toward:

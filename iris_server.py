@@ -109,7 +109,7 @@ class ProjectUpdateRequest(BaseModel):
     status: str | None = None     # active | archived | paused
 
 class IngestRequest(BaseModel):
-    project_id:     str
+    project_id:     str | None = None
     filename:       str
     content:        str
     doc_type:       str = "markdown"
@@ -123,7 +123,7 @@ class DocumentMetadataUpdate(BaseModel):
     finality:        str | None = None
 
 class DocumentProjectUpdate(BaseModel):
-    project_id: str
+    project_id: str | None
 
 class NoteUpdateRequest(BaseModel):
     content: str | None = None
@@ -1257,6 +1257,20 @@ async def archive_project(project_id: str):
     return {"archived": project_id}
 
 
+@app.get("/documents/global")
+async def list_global_documents():
+    """List documents with no project assignment (global / shared scope).
+    These chunks are included in RAG retrieval for every project."""
+    db = _get_db()
+    docs = iris_memory.get_documents(db, global_only=True)
+    result = []
+    for doc in docs:
+        job = iris_memory.get_ingestion_job_for_document(db, doc["id"])
+        result.append({**doc, "job_status": job["status"] if job else None})
+    db.close()
+    return result
+
+
 @app.get("/projects/{project_id}/documents")
 async def list_project_documents(project_id: str):
     db = _get_db()
@@ -1372,7 +1386,7 @@ def _save_pdf_sidecar(markdown: str, filename: str, file_hash: str) -> str:
 @app.post("/documents/ingest-pdf")
 async def ingest_pdf(
     file:            UploadFile = File(...),
-    project_id:      str        = Form(...),
+    project_id:      str | None = Form(None),
     authority_level: str        = Form("Informational"),
     document_type:   str        = Form("other"),
     finality:        str        = Form("final"),
@@ -1391,6 +1405,9 @@ async def ingest_pdf(
     filename = file.filename or "upload.pdf"
     if not filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are accepted at this endpoint.")
+
+    # Coerce empty string (sent by multipart clients when no project selected) to None
+    project_id = project_id or None
 
     pdf_bytes = await file.read()
     file_hash = hashlib.sha256(pdf_bytes).hexdigest()
@@ -1505,14 +1522,16 @@ async def update_document_metadata(doc_id: str, req: DocumentMetadataUpdate):
 
 @app.patch("/documents/{doc_id}/project")
 async def move_document_project(doc_id: str, req: DocumentProjectUpdate):
-    """Move a document and all its ingestion artifacts to a different project.
+    """Move a document and all its ingestion artifacts to a different project,
+    or to global/shared scope (project_id: null).
     Durable promoted memory notes are preserved in their current project."""
     db = _get_db()
-    # Verify target project exists
-    proj = db.execute("SELECT id FROM projects WHERE id = ?", (req.project_id,)).fetchone()
-    if not proj:
-        db.close()
-        raise HTTPException(status_code=404, detail="Target project not found")
+    # Only verify the target project exists when moving to a specific project
+    if req.project_id is not None:
+        proj = db.execute("SELECT id FROM projects WHERE id = ?", (req.project_id,)).fetchone()
+        if not proj:
+            db.close()
+            raise HTTPException(status_code=404, detail="Target project not found")
     moved = iris_memory.move_document_project(db, doc_id, req.project_id)
     db.close()
     if not moved:

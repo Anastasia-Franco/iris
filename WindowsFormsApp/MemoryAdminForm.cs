@@ -182,13 +182,63 @@ namespace WindowsFormsApp
                 btnInspectContext, btnTokenBudget
             });
 
-            // ── Right panel: note grid + editor ──
-            var rightPanel = new Panel { Dock = DockStyle.Fill, Padding = new Padding(6) };
+            // ── Right panel: grid (Fill) above a docked editor panel (Bottom) ──
+            // This dock layout ensures action buttons are always visible regardless
+            // of form height — avoids the previous fixed-position overlap bug.
+            var rightPanel = new Panel { Dock = DockStyle.Fill };
 
+            // ── Bottom editor panel ──────────────────────────────────────────
+            var editorPanel = new Panel
+            {
+                Dock = DockStyle.Bottom, Height = 170,
+                BackColor = Color.FromArgb(35, 35, 35), Padding = new Padding(6, 4, 6, 4)
+            };
+
+            // Scope + State row (Dock=Top inside editorPanel)
+            var metaRow = new Panel { Dock = DockStyle.Top, Height = 48, BackColor = Color.Transparent };
+            lblNoteScope = new Label { Text = "Scope", AutoSize = true, ForeColor = Color.Silver, Location = new Point(0, 0) };
+            cmbNoteScope = new ComboBox
+            {
+                Location = new Point(0, 16), Size = new Size(120, 23),
+                BackColor = Color.FromArgb(55, 55, 55), ForeColor = Color.White, DropDownStyle = ComboBoxStyle.DropDownList
+            };
+            cmbNoteScope.Items.AddRange(new object[] { "global", "operator", "project", "research", "session" });
+            cmbNoteScope.SelectedIndex = 0;
+            lblNoteState = new Label { Text = "State", AutoSize = true, ForeColor = Color.Silver, Location = new Point(128, 0) };
+            cmbNoteState = new ComboBox
+            {
+                Location = new Point(128, 16), Size = new Size(120, 23),
+                BackColor = Color.FromArgb(55, 55, 55), ForeColor = Color.White, DropDownStyle = ComboBoxStyle.DropDownList
+            };
+            cmbNoteState.Items.AddRange(new object[] { "durable", "pinned", "ephemeral", "session", "archived", "deleted" });
+            cmbNoteState.SelectedIndex = 0;
+            metaRow.Controls.AddRange(new Control[] { lblNoteScope, cmbNoteScope, lblNoteState, cmbNoteState });
+
+            // Action button strip (Dock=Bottom inside editorPanel)
+            var btnStrip = new Panel { Dock = DockStyle.Bottom, Height = 34, BackColor = Color.Transparent };
+            btnSaveNote    = MakeButton("Save Changes",  new Point(0,   4), new Size(120, 26)); btnSaveNote.Click    += (_, _) => _ = SaveNoteChangesAsync();
+            btnNewNote     = MakeButton("New Note",      new Point(128, 4), new Size(100, 26)); btnNewNote.Click     += (_, _) => _ = CreateNewNoteAsync();
+            btnArchiveNote = MakeButton("Archive",       new Point(236, 4), new Size(90,  26)); btnArchiveNote.BackColor = Color.DarkGoldenrod; btnArchiveNote.Click += (_, _) => _ = ArchiveNoteAsync();
+            btnDeleteNote  = MakeButton("Delete",        new Point(334, 4), new Size(90,  26)); btnDeleteNote.BackColor  = Color.DarkRed;       btnDeleteNote.Click  += (_, _) => _ = DeleteNoteAsync();
+            btnStrip.Controls.AddRange(new Control[] { btnSaveNote, btnNewNote, btnArchiveNote, btnDeleteNote });
+
+            // Content textbox fills remaining editor panel space (no Bottom anchor = no overflow)
+            txtNoteContent = new TextBox
+            {
+                Dock = DockStyle.Fill,
+                Multiline = true, ScrollBars = ScrollBars.Vertical,
+                BackColor = Color.FromArgb(45, 45, 45), ForeColor = Color.White, Font = new Font("Consolas", 10f)
+            };
+
+            // Add to editorPanel: Bottom first, Fill second, Top last (WinForms docking order)
+            editorPanel.Controls.Add(btnStrip);
+            editorPanel.Controls.Add(txtNoteContent);
+            editorPanel.Controls.Add(metaRow);
+
+            // Notes grid fills all space above the editor panel
             gridNotes = new DataGridView
             {
-                Location = new Point(6, 6), Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
-                Height = 280, Width = 870,
+                Dock = DockStyle.Fill,
                 BackgroundColor = Color.FromArgb(40, 40, 40),
                 ForeColor = Color.White, ColumnHeadersDefaultCellStyle = { BackColor = Color.FromArgb(60, 60, 60), ForeColor = Color.White },
                 DefaultCellStyle = { BackColor = Color.FromArgb(45, 45, 45), ForeColor = Color.White, SelectionBackColor = Color.SteelBlue },
@@ -205,45 +255,9 @@ namespace WindowsFormsApp
             gridNotes.Columns.Add(new DataGridViewTextBoxColumn { Name = "colCreated",  HeaderText = "Created",    Width = 100, FillWeight = 10 });
             gridNotes.SelectionChanged += GridNotes_SelectionChanged;
 
-            int editorTop = 294;
-
-            lblNoteScope = new Label { Text = "Scope", AutoSize = true, ForeColor = Color.Silver, Location = new Point(6, editorTop) };
-            cmbNoteScope = new ComboBox
-            {
-                Location = new Point(6, editorTop + 17), Size = new Size(120, 23),
-                BackColor = Color.FromArgb(55, 55, 55), ForeColor = Color.White, DropDownStyle = ComboBoxStyle.DropDownList
-            };
-            cmbNoteScope.Items.AddRange(new object[] { "global", "operator", "project", "research", "session" });
-            cmbNoteScope.SelectedIndex = 0;
-
-            lblNoteState = new Label { Text = "State", AutoSize = true, ForeColor = Color.Silver, Location = new Point(134, editorTop) };
-            cmbNoteState = new ComboBox
-            {
-                Location = new Point(134, editorTop + 17), Size = new Size(120, 23),
-                BackColor = Color.FromArgb(55, 55, 55), ForeColor = Color.White, DropDownStyle = ComboBoxStyle.DropDownList
-            };
-            cmbNoteState.Items.AddRange(new object[] { "durable", "pinned", "ephemeral", "session", "archived", "deleted" });
-            cmbNoteState.SelectedIndex = 0;
-
-            txtNoteContent = new TextBox
-            {
-                Location = new Point(6, editorTop + 47), Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom,
-                Height = 130, Width = 870,
-                Multiline = true, ScrollBars = ScrollBars.Vertical,
-                BackColor = Color.FromArgb(45, 45, 45), ForeColor = Color.White, Font = new Font("Consolas", 10f)
-            };
-
-            int btnTop = editorTop + 185;
-            btnSaveNote    = MakeButton("Save Changes",  new Point(6,   btnTop), new Size(120, 26)); btnSaveNote.Click    += (_, _) => _ = SaveNoteChangesAsync();
-            btnNewNote     = MakeButton("New Note",      new Point(134, btnTop), new Size(100, 26)); btnNewNote.Click     += (_, _) => _ = CreateNewNoteAsync();
-            btnArchiveNote = MakeButton("Archive",       new Point(242, btnTop), new Size(90,  26)); btnArchiveNote.BackColor = Color.DarkGoldenrod; btnArchiveNote.Click += (_, _) => _ = ArchiveNoteAsync();
-            btnDeleteNote  = MakeButton("Delete",        new Point(340, btnTop), new Size(90,  26)); btnDeleteNote.BackColor  = Color.DarkRed;       btnDeleteNote.Click  += (_, _) => _ = DeleteNoteAsync();
-
-            rightPanel.Controls.AddRange(new Control[]
-            {
-                gridNotes, lblNoteScope, cmbNoteScope, lblNoteState, cmbNoteState,
-                txtNoteContent, btnSaveNote, btnNewNote, btnArchiveNote, btnDeleteNote
-            });
+            // Add editorPanel first (Bottom), then gridNotes (Fill) — order determines docking
+            rightPanel.Controls.Add(editorPanel);
+            rightPanel.Controls.Add(gridNotes);
 
             tabMemory.Controls.Add(rightPanel);
             tabMemory.Controls.Add(leftPanel);
@@ -253,71 +267,90 @@ namespace WindowsFormsApp
         {
             tabDocs = new TabPage("Documents") { BackColor = Color.FromArgb(30, 30, 30), ForeColor = Color.White };
 
-            var leftPanel = new Panel { Width = 200, Dock = DockStyle.Left, Padding = new Padding(6) };
+            // ── Left panel: dock-based so controls never clip ───────────────
+            var leftPanel = new Panel { Width = 206, Dock = DockStyle.Left };
 
-            var lblDocProj = new Label { Text = "Project", AutoSize = true, ForeColor = Color.Silver, Location = new Point(6, 6) };
-            lstDocProjects = new ListBox
+            // ── Bottom action strip (Dock=Bottom) — always visible ──────────
+            var actionPanel = new Panel
             {
-                Location = new Point(6, 24), Size = new Size(188, 300),
-                BackColor = Color.FromArgb(45, 45, 45), ForeColor = Color.White
+                Dock = DockStyle.Bottom, Height = 318,
+                BackColor = Color.FromArgb(30, 30, 30), Padding = new Padding(6, 4, 6, 4)
             };
-            lstDocProjects.SelectedIndexChanged += (_, _) => _ = RefreshDocsAsync();
 
-            btnRefreshDocs = MakeButton("Refresh", new Point(6, 334), new Size(188, 28));
+            btnRefreshDocs = MakeButton("Refresh", new Point(6, 0), new Size(188, 28));
             btnRefreshDocs.Click += (_, _) => _ = RefreshDocsAsync();
 
-            btnIngestFile = MakeButton("Ingest File…", new Point(6, 370), new Size(188, 28));
+            btnIngestFile = MakeButton("Ingest File…", new Point(6, 34), new Size(188, 28));
             btnIngestFile.BackColor = Color.FromArgb(0, 100, 150);
             btnIngestFile.Click += BtnIngestFile_Click;
 
-            btnDeleteDoc = MakeButton("Delete Document", new Point(6, 406), new Size(188, 28));
+            btnDeleteDoc = MakeButton("Delete Document", new Point(6, 68), new Size(188, 28));
             btnDeleteDoc.BackColor = Color.DarkRed;
             btnDeleteDoc.Click += (_, _) => _ = DeleteDocAsync();
 
-            // Authority metadata controls
-            var lblAuth = new Label { Text = "Authority Level", AutoSize = true, ForeColor = Color.Silver, Location = new Point(6, 442) };
+            var lblAuth = new Label { Text = "Authority Level", AutoSize = true, ForeColor = Color.Silver, Location = new Point(6, 104) };
             cmbDocAuthority = new ComboBox
             {
-                Location = new Point(6, 458), Size = new Size(188, 24),
+                Location = new Point(6, 120), Size = new Size(188, 24),
                 BackColor = Color.FromArgb(55, 55, 55), ForeColor = Color.White,
                 DropDownStyle = ComboBoxStyle.DropDownList, FlatStyle = FlatStyle.Flat
             };
             cmbDocAuthority.Items.AddRange(new object[] { "Definitive", "Authoritative", "Informational", "Contextual", "Anecdotal" });
-            cmbDocAuthority.SelectedIndex = 2; // default: Informational
+            cmbDocAuthority.SelectedIndex = 2;
 
-            var lblDocTypeLabel = new Label { Text = "Document Type", AutoSize = true, ForeColor = Color.Silver, Location = new Point(6, 488) };
+            var lblDocTypeLabel = new Label { Text = "Document Type", AutoSize = true, ForeColor = Color.Silver, Location = new Point(6, 150) };
             cmbDocType = new ComboBox
             {
-                Location = new Point(6, 504), Size = new Size(188, 24),
+                Location = new Point(6, 166), Size = new Size(188, 24),
                 BackColor = Color.FromArgb(55, 55, 55), ForeColor = Color.White,
                 DropDownStyle = ComboBoxStyle.DropDownList, FlatStyle = FlatStyle.Flat
             };
             cmbDocType.Items.AddRange(new object[] { "published_framework", "operational_guide", "strategic_draft", "meeting_notes", "planning_discussion", "other" });
-            cmbDocType.SelectedIndex = 5; // default: other
+            cmbDocType.SelectedIndex = 5;
 
-            var lblFinality = new Label { Text = "Finality", AutoSize = true, ForeColor = Color.Silver, Location = new Point(6, 534) };
+            var lblFinality = new Label { Text = "Finality", AutoSize = true, ForeColor = Color.Silver, Location = new Point(6, 196) };
             cmbDocFinality = new ComboBox
             {
-                Location = new Point(6, 550), Size = new Size(188, 24),
+                Location = new Point(6, 212), Size = new Size(188, 24),
                 BackColor = Color.FromArgb(55, 55, 55), ForeColor = Color.White,
                 DropDownStyle = ComboBoxStyle.DropDownList, FlatStyle = FlatStyle.Flat
             };
             cmbDocFinality.Items.AddRange(new object[] { "final", "draft", "provisional" });
-            cmbDocFinality.SelectedIndex = 0; // default: final
+            cmbDocFinality.SelectedIndex = 0;
 
-            btnEditDocMeta = MakeButton("Edit Metadata…", new Point(6, 582), new Size(188, 28));
+            btnEditDocMeta = MakeButton("Edit Metadata…", new Point(6, 244), new Size(188, 28));
             btnEditDocMeta.BackColor = Color.FromArgb(60, 80, 120);
             btnEditDocMeta.Click += BtnEditDocMeta_Click;
 
-            btnMoveDoc = MakeButton("Move to Project…", new Point(6, 618), new Size(188, 28));
+            btnMoveDoc = MakeButton("Move to Project…", new Point(6, 280), new Size(188, 28));
             btnMoveDoc.BackColor = Color.FromArgb(50, 100, 80);
             btnMoveDoc.Click += BtnMoveDoc_Click;
 
-            leftPanel.Controls.AddRange(new Control[] {
-                lblDocProj, lstDocProjects, btnRefreshDocs, btnIngestFile, btnDeleteDoc,
-                lblAuth, cmbDocAuthority, lblDocTypeLabel, cmbDocType, lblFinality, cmbDocFinality,
-                btnEditDocMeta, btnMoveDoc
+            actionPanel.Controls.AddRange(new Control[] {
+                btnRefreshDocs, btnIngestFile, btnDeleteDoc,
+                lblAuth, cmbDocAuthority, lblDocTypeLabel, cmbDocType,
+                lblFinality, cmbDocFinality, btnEditDocMeta, btnMoveDoc
             });
+
+            // ── Top project list (Dock=Fill) — takes remaining space ────────
+            var topPanel = new Panel { Dock = DockStyle.Fill };
+            var lblDocProj = new Label
+            {
+                Text = "Project", AutoSize = true, ForeColor = Color.Silver,
+                Dock = DockStyle.Top, Height = 20, Padding = new Padding(6, 4, 0, 0)
+            };
+            lstDocProjects = new ListBox
+            {
+                Dock = DockStyle.Fill,
+                BackColor = Color.FromArgb(45, 45, 45), ForeColor = Color.White
+            };
+            lstDocProjects.SelectedIndexChanged += (_, _) => _ = RefreshDocsAsync();
+            topPanel.Controls.Add(lstDocProjects);
+            topPanel.Controls.Add(lblDocProj);
+
+            // Add actionPanel first (Dock=Bottom), then topPanel (Dock=Fill)
+            leftPanel.Controls.Add(actionPanel);
+            leftPanel.Controls.Add(topPanel);
 
             gridDocs = new DataGridView
             {
@@ -661,6 +694,7 @@ namespace WindowsFormsApp
                 var json = await _http.GetStringAsync("projects");
                 using var doc = JsonDocument.Parse(json);
                 lstDocProjects.Items.Clear();
+                lstDocProjects.Items.Add(new ProjectFilterItem("__global__", "(Global / Shared)"));
                 foreach (var p in doc.RootElement.EnumerateArray())
                 {
                     string id   = p.GetProperty("id").GetString() ?? "";
@@ -934,18 +968,23 @@ namespace WindowsFormsApp
             if (lstDocProjects.SelectedItem is not ProjectFilterItem proj || proj.Id == "") return;
             try
             {
-                var json = await _http.GetStringAsync($"projects/{proj.Id}/documents");
+                string url = proj.Id == "__global__"
+                    ? "documents/global"
+                    : $"projects/{proj.Id}/documents";
+                var json = await _http.GetStringAsync(url);
                 using var doc = JsonDocument.Parse(json);
                 gridDocs.Rows.Clear();
                 foreach (var d in doc.RootElement.EnumerateArray())
                 {
-                    string id      = d.GetProperty("id").GetString() ?? "";
-                    string fn      = d.GetProperty("filename").GetString() ?? "";
-                    string dt      = d.GetProperty("doc_type").GetString() ?? "";
-                    int    chunks  = d.TryGetProperty("chunk_count", out var cc) ? cc.GetInt32() : 0;
-                    string status  = d.TryGetProperty("job_status",  out var js) ? js.GetString() ?? "" : "";
-                    string date    = (d.GetProperty("ingested_at").GetString() ?? "")["".Length..Math.Min(10, d.GetProperty("ingested_at").GetString()?.Length ?? 0)];
-                    int row = gridDocs.Rows.Add(id, fn, dt, chunks, status, date);
+                    string id        = d.GetProperty("id").GetString() ?? "";
+                    string fn        = d.GetProperty("filename").GetString() ?? "";
+                    string dt        = d.TryGetProperty("doc_type",       out var dtt) ? dtt.GetString() ?? "" : "";
+                    string authority = d.TryGetProperty("authority_level", out var al)  ? al.GetString()  ?? "" : "";
+                    string purpose   = d.TryGetProperty("document_type",   out var dtp) ? dtp.GetString()  ?? "" : "";
+                    int    chunks    = d.TryGetProperty("chunk_count",      out var cc)  ? cc.GetInt32()        : 0;
+                    string status    = d.TryGetProperty("job_status",       out var js)  ? js.GetString()  ?? "" : "";
+                    string date      = (d.GetProperty("ingested_at").GetString() ?? "")["".Length..Math.Min(10, d.GetProperty("ingested_at").GetString()?.Length ?? 0)];
+                    int row = gridDocs.Rows.Add(id, fn, dt, authority, purpose, chunks, status, date);
                     gridDocs.Rows[row].Tag = id;
                 }
             }
@@ -964,6 +1003,9 @@ namespace WindowsFormsApp
             };
             if (dlg.ShowDialog() != DialogResult.OK) return;
 
+            // Null project_id means global/shared scope
+            string? projectId = proj.Id == "__global__" ? null : proj.Id;
+
             try
             {
                 string filename = System.IO.Path.GetFileName(dlg.FileName);
@@ -971,7 +1013,7 @@ namespace WindowsFormsApp
 
                 if (ext == ".pdf")
                 {
-                    await IngestPdfAsync(dlg.FileName, filename, proj.Id);
+                    await IngestPdfAsync(dlg.FileName, filename, projectId);
                 }
                 else
                 {
@@ -983,7 +1025,7 @@ namespace WindowsFormsApp
 
                     var body = JsonSerializer.Serialize(new
                     {
-                        project_id      = proj.Id,
+                        project_id      = projectId,
                         filename,
                         content,
                         doc_type        = docType,
@@ -1006,7 +1048,7 @@ namespace WindowsFormsApp
             catch (Exception ex) { ShowError(ex.Message); }
         }
 
-        private async Task IngestPdfAsync(string filePath, string filename, string projectId)
+        private async Task IngestPdfAsync(string filePath, string filename, string? projectId)
         {
             // Stream the PDF as multipart/form-data to /documents/ingest-pdf.
             // The server extracts text via PyMuPDF and feeds the result through
@@ -1017,7 +1059,8 @@ namespace WindowsFormsApp
             fileContent.Headers.ContentType =
                 new System.Net.Http.Headers.MediaTypeHeaderValue("application/pdf");
             multipart.Add(fileContent,  "file",       filename);
-            multipart.Add(new StringContent(projectId), "project_id");
+            // Send empty string for global scope — server coerces "" to None
+            multipart.Add(new StringContent(projectId ?? ""), "project_id");
             multipart.Add(new StringContent(cmbDocAuthority.SelectedItem?.ToString() ?? "Informational"), "authority_level");
             multipart.Add(new StringContent(cmbDocType.SelectedItem?.ToString()      ?? "other"),          "document_type");
             multipart.Add(new StringContent(cmbDocFinality.SelectedItem?.ToString()  ?? "final"),           "finality");
@@ -1078,8 +1121,8 @@ namespace WindowsFormsApp
             }
             catch (Exception ex) { ShowError($"Could not load projects: {ex.Message}"); return; }
 
-            if (projects.Count == 0)
-            { MessageBox.Show("No active projects found."); return; }
+            // Always include global as the first option
+            projects.Insert(0, ("__global__", "(Global / No Project)"));
 
             var dlg = new Form
             {
@@ -1107,10 +1150,11 @@ namespace WindowsFormsApp
             if (dlg.ShowDialog(this) != DialogResult.OK) return;
 
             var (targetId, targetName) = projects[cmb.SelectedIndex];
-            await MoveDocAsync(_selectedDocId, targetId, targetName);
+            string? resolvedId = targetId == "__global__" ? null : targetId;
+            await MoveDocAsync(_selectedDocId, resolvedId, targetName);
         }
 
-        private async Task MoveDocAsync(string docId, string targetProjectId, string targetProjectName)
+        private async Task MoveDocAsync(string docId, string? targetProjectId, string targetProjectName)
         {
             try
             {
@@ -1120,8 +1164,9 @@ namespace WindowsFormsApp
                     new StringContent(body, Encoding.UTF8, "application/json"));
                 resp.EnsureSuccessStatusCode();
                 await RefreshDocsAsync();
+                string dest = targetProjectId is null ? "Global / No Project" : $"\"{ targetProjectName}\"";
                 MessageBox.Show(
-                    $"Document moved to \"{targetProjectName}\".\n\nNote: promoted memory notes are preserved in their original project.",
+                    $"Document moved to {dest}.\n\nNote: promoted memory notes are preserved in their original project.",
                     "Moved", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
             catch (Exception ex) { ShowError(ex.Message); }
@@ -1145,12 +1190,21 @@ namespace WindowsFormsApp
             var lblA = new Label { Text = "Authority Level", Location = new Point(12,  14), AutoSize = true, ForeColor = Color.Silver };
             var cmbA = new ComboBox { Location = new Point(12, 32), Size = new Size(290, 24), DropDownStyle = ComboBoxStyle.DropDownList };
             cmbA.Items.AddRange(new object[] { "Definitive", "Authoritative", "Informational", "Contextual", "Anecdotal" });
-            cmbA.SelectedItem = cmbDocAuthority.SelectedItem ?? "Informational";
+            // Pre-populate from the selected document's current grid values
+            string currentAuthority = gridDocs.SelectedRows.Count > 0
+                ? gridDocs.SelectedRows[0].Cells["colDocAuthority"].Value?.ToString() ?? "Informational"
+                : cmbDocAuthority.SelectedItem?.ToString() ?? "Informational";
+            string currentPurpose = gridDocs.SelectedRows.Count > 0
+                ? gridDocs.SelectedRows[0].Cells["colDocDocType"].Value?.ToString() ?? "other"
+                : cmbDocType.SelectedItem?.ToString() ?? "other";
+            cmbA.SelectedItem = currentAuthority;
+            if (cmbA.SelectedIndex < 0) cmbA.SelectedIndex = 2; // fallback: Informational
 
             var lblT = new Label { Text = "Document Type", Location = new Point(12, 62), AutoSize = true, ForeColor = Color.Silver };
             var cmbT = new ComboBox { Location = new Point(12, 80), Size = new Size(290, 24), DropDownStyle = ComboBoxStyle.DropDownList };
             cmbT.Items.AddRange(new object[] { "published_framework", "operational_guide", "strategic_draft", "meeting_notes", "planning_discussion", "other" });
-            cmbT.SelectedItem = cmbDocType.SelectedItem ?? "other";
+            cmbT.SelectedItem = currentPurpose;
+            if (cmbT.SelectedIndex < 0) cmbT.SelectedIndex = 5; // fallback: other
 
             var lblF = new Label { Text = "Finality", Location = new Point(12, 110), AutoSize = true, ForeColor = Color.Silver };
             var cmbF = new ComboBox { Location = new Point(12, 128), Size = new Size(290, 24), DropDownStyle = ComboBoxStyle.DropDownList };

@@ -560,7 +560,7 @@ def touch_memory_note(conn: sqlite3.Connection, note_id: str) -> None:
 
 def add_document(
     conn: sqlite3.Connection,
-    project_id: str,
+    project_id: str | None,
     filename: str,
     file_hash: str = None,
     file_path: str = None,
@@ -584,9 +584,17 @@ def add_document(
     return doc_id
 
 
-def get_documents(conn: sqlite3.Connection, project_id: str = None) -> list[dict]:
+def get_documents(
+    conn: sqlite3.Connection,
+    project_id: str = None,
+    global_only: bool = False,
+) -> list[dict]:
     cols = "id, project_id, filename, file_hash, doc_type, ingested_at, chunk_count, authority_level, document_type, finality"
-    if project_id:
+    if global_only:
+        cursor = conn.execute(
+            f"SELECT {cols} FROM documents WHERE project_id IS NULL ORDER BY ingested_at DESC"
+        )
+    elif project_id:
         cursor = conn.execute(
             f"SELECT {cols} FROM documents WHERE project_id = ? ORDER BY ingested_at DESC",
             (project_id,),
@@ -689,9 +697,10 @@ def delete_document(conn: sqlite3.Connection, doc_id: str) -> None:
 def move_document_project(
     conn: sqlite3.Connection,
     doc_id: str,
-    new_project_id: str,
+    new_project_id: str | None,
 ) -> bool:
-    """Move a document (and all its ingestion artifacts) to a different project.
+    """Move a document (and all its ingestion artifacts) to a different project
+    or to global/shared scope (new_project_id=None).
 
     Updates project_id on:
       - documents
@@ -963,7 +972,9 @@ def search_memory(
         conditions.append("source_type = ?")
         params.append(source_type)
     if project_id:
-        conditions.append("project_id = ?")
+        # Include global (project_id IS NULL) docs in every project search so
+        # shared reference documents surface regardless of which project is active.
+        conditions.append("(project_id = ? OR project_id IS NULL)")
         params.append(project_id)
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     cursor = conn.execute(
