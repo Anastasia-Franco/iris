@@ -50,6 +50,9 @@ namespace WindowsFormsApp
             label1 = new Label();
             label3 = new Label();
             pnlStreamArea = new Panel();
+            cmbProject = new ComboBox();
+            labelProject = new Label();
+            btnMemory = new Button();
             pnlControls.SuspendLayout();
             SuspendLayout();
             // 
@@ -105,10 +108,38 @@ namespace WindowsFormsApp
             // 
             cmbModel.FormattingEnabled = true;
             cmbModel.Items.AddRange(new object[] { "llama3.3:latest", "qwen3:30b", "qwen3-coder-next:latest", "deepseek-coder-v2:lite", "qwen2.5-coder:1.5b", "deepseek-r1:32b" });
-            cmbModel.Location = new Point(644, 29);
+            cmbModel.Location = new Point(565, 29);
             cmbModel.Name = "cmbModel";
             cmbModel.Size = new Size(169, 23);
             cmbModel.TabIndex = 3;
+            // 
+            // labelProject
+            // 
+            labelProject.AutoSize = true;
+            labelProject.Font = new Font("Segoe UI", 9F, FontStyle.Bold, GraphicsUnit.Point, 0);
+            labelProject.Location = new Point(128, 5);
+            labelProject.Name = "labelProject";
+            labelProject.TabIndex = 10;
+            labelProject.Text = "Project";
+            // 
+            // cmbProject
+            // 
+            cmbProject.FormattingEnabled = true;
+            cmbProject.Location = new Point(128, 29);
+            cmbProject.Name = "cmbProject";
+            cmbProject.Size = new Size(180, 23);
+            cmbProject.TabIndex = 9;
+            cmbProject.SelectedIndexChanged += CmbProject_SelectedIndexChanged;
+            // 
+            // btnMemory
+            // 
+            btnMemory.Location = new Point(320, 26);
+            btnMemory.Name = "btnMemory";
+            btnMemory.Size = new Size(110, 26);
+            btnMemory.TabIndex = 11;
+            btnMemory.Text = "Memory";
+            btnMemory.UseVisualStyleBackColor = true;
+            btnMemory.Click += BtnMemory_Click;
             // 
             // pnlControls
             // 
@@ -118,6 +149,9 @@ namespace WindowsFormsApp
             pnlControls.Controls.Add(cmbModel);
             pnlControls.Controls.Add(btnSend);
             pnlControls.Controls.Add(btnNewSession);
+            pnlControls.Controls.Add(labelProject);
+            pnlControls.Controls.Add(cmbProject);
+            pnlControls.Controls.Add(btnMemory);
             pnlControls.Dock = DockStyle.Bottom;
             pnlControls.Location = new Point(0, 449);
             pnlControls.Name = "pnlControls";
@@ -127,8 +161,8 @@ namespace WindowsFormsApp
             // label2
             // 
             label2.AutoSize = true;
-            label2.Font = new Font("Segoe UI", 12F, FontStyle.Bold, GraphicsUnit.Point, 0);
-            label2.Location = new Point(700, 5);
+            label2.Font = new Font("Segoe UI", 9F, FontStyle.Bold, GraphicsUnit.Point, 0);
+            label2.Location = new Point(565, 5);
             label2.Name = "label2";
             label2.Size = new Size(59, 21);
             label2.TabIndex = 6;
@@ -138,7 +172,7 @@ namespace WindowsFormsApp
             // 
             cmbTask.FormattingEnabled = true;
             cmbTask.Items.AddRange(new object[] { "Chat", "Research", "Code", "Creative", "System" });
-            cmbTask.Location = new Point(529, 29);
+            cmbTask.Location = new Point(449, 29);
             cmbTask.Name = "cmbTask";
             cmbTask.Size = new Size(109, 23);
             cmbTask.TabIndex = 4;
@@ -146,8 +180,8 @@ namespace WindowsFormsApp
             // label1
             // 
             label1.AutoSize = true;
-            label1.Font = new Font("Segoe UI", 12F, FontStyle.Bold, GraphicsUnit.Point, 0);
-            label1.Location = new Point(556, 5);
+            label1.Font = new Font("Segoe UI", 9F, FontStyle.Bold, GraphicsUnit.Point, 0);
+            label1.Location = new Point(449, 5);
             label1.Name = "label1";
             label1.Size = new Size(43, 21);
             label1.TabIndex = 5;
@@ -207,5 +241,8 @@ namespace WindowsFormsApp
         private Label label1;
         private Label label3;
         private Panel pnlStreamArea;
+        private ComboBox cmbProject;
+        private Label labelProject;
+        private System.Windows.Forms.Button btnMemory;
     }
 }

@@ -16,6 +16,7 @@ namespace WindowsFormsApp
         };
 
         private string _currentSessionId = Guid.NewGuid().ToString();
+        private string _currentProjectId = "";
         private StringBuilder _streamBuffer = new();
         private string _preambleRtf = "";
 
@@ -43,6 +44,29 @@ namespace WindowsFormsApp
             _mdH1         = new Font("Segoe UI Emoji", 16f, FontStyle.Bold);
             _mdH2         = new Font("Segoe UI Emoji", 14f, FontStyle.Bold);
             _mdH3         = new Font("Segoe UI Emoji", 13f, FontStyle.Bold);
+
+            _ = LoadProjectsAsync();
+        }
+
+        private async System.Threading.Tasks.Task LoadProjectsAsync()
+        {
+            try
+            {
+                using var resp = await _httpClient.GetAsync("projects");
+                if (!resp.IsSuccessStatusCode) return;
+                var json = await resp.Content.ReadAsStringAsync();
+                using var doc = JsonDocument.Parse(json);
+                cmbProject.Items.Clear();
+                cmbProject.Items.Add("(no project)");
+                foreach (var proj in doc.RootElement.EnumerateArray())
+                {
+                    string name = proj.GetProperty("name").GetString() ?? "";
+                    string id   = proj.GetProperty("id").GetString() ?? "";
+                    cmbProject.Items.Add(new ProjectItem(id, name));
+                }
+                cmbProject.SelectedIndex = 0;
+            }
+            catch { /* server may be unreachable at startup */ }
         }
 
         private async void BtnSend_Click(object sender, EventArgs e)
@@ -82,6 +106,7 @@ namespace WindowsFormsApp
             var requestBody = new
             {
                 session_id = _currentSessionId,
+                project_id = string.IsNullOrEmpty(_currentProjectId) ? null : _currentProjectId,
                 prompt,
                 model = selectedModel,
                 mode = selectedMode
@@ -131,6 +156,19 @@ namespace WindowsFormsApp
 
             txtPrompt.Clear();
             btnSend.Enabled = true;
+        }
+
+        private void CmbProject_SelectedIndexChanged(object sender, EventArgs e)
+        {
+            if (cmbProject.SelectedItem is ProjectItem proj)
+                _currentProjectId = proj.Id;
+            else
+                _currentProjectId = "";
+        }
+
+        private void BtnMemory_Click(object sender, EventArgs e)
+        {
+            new MemoryAdminForm(_currentSessionId).Show(this);
         }
 
         private void TxtPrompt_TextChanged(object sender, EventArgs e)
@@ -253,5 +291,14 @@ namespace WindowsFormsApp
         {
 
         }
+    }
+
+    /// <summary>Holds a project id + display name for cmbProject items.</summary>
+    internal sealed class ProjectItem
+    {
+        public string Id   { get; }
+        public string Name { get; }
+        public ProjectItem(string id, string name) { Id = id; Name = name; }
+        public override string ToString() => Name;
     }
 }
