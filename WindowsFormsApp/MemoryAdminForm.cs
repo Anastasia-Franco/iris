@@ -60,6 +60,11 @@ namespace WindowsFormsApp
         private Button btnIngestFile;
         private Button btnDeleteDoc;
         private Button btnRefreshDocs;
+        private Button btnEditDocMeta;
+        private Button btnMoveDoc;
+        private ComboBox cmbDocAuthority;
+        private ComboBox cmbDocType;
+        private ComboBox cmbDocFinality;
 
         // Projects tab
         private TabPage tabProjects;
@@ -269,7 +274,50 @@ namespace WindowsFormsApp
             btnDeleteDoc.BackColor = Color.DarkRed;
             btnDeleteDoc.Click += (_, _) => _ = DeleteDocAsync();
 
-            leftPanel.Controls.AddRange(new Control[] { lblDocProj, lstDocProjects, btnRefreshDocs, btnIngestFile, btnDeleteDoc });
+            // Authority metadata controls
+            var lblAuth = new Label { Text = "Authority Level", AutoSize = true, ForeColor = Color.Silver, Location = new Point(6, 442) };
+            cmbDocAuthority = new ComboBox
+            {
+                Location = new Point(6, 458), Size = new Size(188, 24),
+                BackColor = Color.FromArgb(55, 55, 55), ForeColor = Color.White,
+                DropDownStyle = ComboBoxStyle.DropDownList, FlatStyle = FlatStyle.Flat
+            };
+            cmbDocAuthority.Items.AddRange(new object[] { "Definitive", "Authoritative", "Informational", "Contextual", "Anecdotal" });
+            cmbDocAuthority.SelectedIndex = 2; // default: Informational
+
+            var lblDocTypeLabel = new Label { Text = "Document Type", AutoSize = true, ForeColor = Color.Silver, Location = new Point(6, 488) };
+            cmbDocType = new ComboBox
+            {
+                Location = new Point(6, 504), Size = new Size(188, 24),
+                BackColor = Color.FromArgb(55, 55, 55), ForeColor = Color.White,
+                DropDownStyle = ComboBoxStyle.DropDownList, FlatStyle = FlatStyle.Flat
+            };
+            cmbDocType.Items.AddRange(new object[] { "published_framework", "operational_guide", "strategic_draft", "meeting_notes", "planning_discussion", "other" });
+            cmbDocType.SelectedIndex = 5; // default: other
+
+            var lblFinality = new Label { Text = "Finality", AutoSize = true, ForeColor = Color.Silver, Location = new Point(6, 534) };
+            cmbDocFinality = new ComboBox
+            {
+                Location = new Point(6, 550), Size = new Size(188, 24),
+                BackColor = Color.FromArgb(55, 55, 55), ForeColor = Color.White,
+                DropDownStyle = ComboBoxStyle.DropDownList, FlatStyle = FlatStyle.Flat
+            };
+            cmbDocFinality.Items.AddRange(new object[] { "final", "draft", "provisional" });
+            cmbDocFinality.SelectedIndex = 0; // default: final
+
+            btnEditDocMeta = MakeButton("Edit Metadata…", new Point(6, 582), new Size(188, 28));
+            btnEditDocMeta.BackColor = Color.FromArgb(60, 80, 120);
+            btnEditDocMeta.Click += BtnEditDocMeta_Click;
+
+            btnMoveDoc = MakeButton("Move to Project…", new Point(6, 618), new Size(188, 28));
+            btnMoveDoc.BackColor = Color.FromArgb(50, 100, 80);
+            btnMoveDoc.Click += BtnMoveDoc_Click;
+
+            leftPanel.Controls.AddRange(new Control[] {
+                lblDocProj, lstDocProjects, btnRefreshDocs, btnIngestFile, btnDeleteDoc,
+                lblAuth, cmbDocAuthority, lblDocTypeLabel, cmbDocType, lblFinality, cmbDocFinality,
+                btnEditDocMeta, btnMoveDoc
+            });
 
             gridDocs = new DataGridView
             {
@@ -281,12 +329,14 @@ namespace WindowsFormsApp
                 ReadOnly = true, SelectionMode = DataGridViewSelectionMode.FullRowSelect,
                 MultiSelect = false, AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill
             };
-            gridDocs.Columns.Add(new DataGridViewTextBoxColumn { Name = "colDocId",      HeaderText = "ID",       FillWeight = 10 });
-            gridDocs.Columns.Add(new DataGridViewTextBoxColumn { Name = "colDocFile",     HeaderText = "Filename", FillWeight = 35 });
-            gridDocs.Columns.Add(new DataGridViewTextBoxColumn { Name = "colDocType",     HeaderText = "Type",     FillWeight = 10 });
-            gridDocs.Columns.Add(new DataGridViewTextBoxColumn { Name = "colDocChunks",   HeaderText = "Chunks",   FillWeight = 10 });
-            gridDocs.Columns.Add(new DataGridViewTextBoxColumn { Name = "colDocStatus",   HeaderText = "Status",   FillWeight = 15 });
-            gridDocs.Columns.Add(new DataGridViewTextBoxColumn { Name = "colDocIngested", HeaderText = "Ingested", FillWeight = 20 });
+            gridDocs.Columns.Add(new DataGridViewTextBoxColumn { Name = "colDocId",        HeaderText = "ID",        FillWeight = 8  });
+            gridDocs.Columns.Add(new DataGridViewTextBoxColumn { Name = "colDocFile",       HeaderText = "Filename",  FillWeight = 30 });
+            gridDocs.Columns.Add(new DataGridViewTextBoxColumn { Name = "colDocType",       HeaderText = "Doc Type",  FillWeight = 8  });
+            gridDocs.Columns.Add(new DataGridViewTextBoxColumn { Name = "colDocAuthority",  HeaderText = "Authority", FillWeight = 12 });
+            gridDocs.Columns.Add(new DataGridViewTextBoxColumn { Name = "colDocDocType",    HeaderText = "Purpose",   FillWeight = 14 });
+            gridDocs.Columns.Add(new DataGridViewTextBoxColumn { Name = "colDocChunks",     HeaderText = "Chunks",    FillWeight = 7  });
+            gridDocs.Columns.Add(new DataGridViewTextBoxColumn { Name = "colDocStatus",     HeaderText = "Status",    FillWeight = 11 });
+            gridDocs.Columns.Add(new DataGridViewTextBoxColumn { Name = "colDocIngested",   HeaderText = "Ingested",  FillWeight = 10 });
             gridDocs.SelectionChanged += (_, _) =>
             {
                 if (gridDocs.SelectedRows.Count > 0)
@@ -909,33 +959,233 @@ namespace WindowsFormsApp
 
             using var dlg = new OpenFileDialog
             {
-                Filter = "Markdown / Text|*.md;*.txt|All files|*.*",
-                Title = "Select document to ingest"
+                Filter = "Documents|*.md;*.txt;*.pdf|Markdown|*.md|Text|*.txt|PDF|*.pdf|All files|*.*",
+                Title  = "Select document to ingest"
             };
             if (dlg.ShowDialog() != DialogResult.OK) return;
 
             try
             {
-                string content  = System.IO.File.ReadAllText(dlg.FileName);
                 string filename = System.IO.Path.GetFileName(dlg.FileName);
                 string ext      = System.IO.Path.GetExtension(dlg.FileName).ToLowerInvariant();
-                string docType  = ext == ".md" ? "markdown" : "text";
 
-                var body = JsonSerializer.Serialize(new
+                if (ext == ".pdf")
                 {
-                    project_id = proj.Id,
-                    filename,
-                    content,
-                    doc_type = docType
-                });
-                var resp = await _http.PostAsync("documents/ingest",
+                    await IngestPdfAsync(dlg.FileName, filename, proj.Id);
+                }
+                else
+                {
+                    string content = System.IO.File.ReadAllText(dlg.FileName);
+                    string docType = ext == ".md" ? "markdown" : "text";
+                    string authority = cmbDocAuthority.SelectedItem?.ToString() ?? "Informational";
+                    string purpose   = cmbDocType.SelectedItem?.ToString()      ?? "other";
+                    string finality  = cmbDocFinality.SelectedItem?.ToString()  ?? "final";
+
+                    var body = JsonSerializer.Serialize(new
+                    {
+                        project_id      = proj.Id,
+                        filename,
+                        content,
+                        doc_type        = docType,
+                        authority_level = authority,
+                        document_type   = purpose,
+                        finality
+                    });
+                    var resp = await _http.PostAsync("documents/ingest",
+                        new StringContent(body, Encoding.UTF8, "application/json"));
+                    resp.EnsureSuccessStatusCode();
+                    var result = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+                    string jobId = result.RootElement.GetProperty("job_id").GetString() ?? "";
+                    MessageBox.Show(
+                        $"Ingestion job queued.\nJob ID: {jobId}\n\nChunking and embedding will complete in the background.",
+                        "Ingestion Queued", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+
+                await RefreshDocsAsync();
+            }
+            catch (Exception ex) { ShowError(ex.Message); }
+        }
+
+        private async Task IngestPdfAsync(string filePath, string filename, string projectId)
+        {
+            // Stream the PDF as multipart/form-data to /documents/ingest-pdf.
+            // The server extracts text via PyMuPDF and feeds the result through
+            // the standard markdown ingestion pipeline.
+            await using var stream  = System.IO.File.OpenRead(filePath);
+            using var multipart     = new MultipartFormDataContent();
+            using var fileContent   = new StreamContent(stream);
+            fileContent.Headers.ContentType =
+                new System.Net.Http.Headers.MediaTypeHeaderValue("application/pdf");
+            multipart.Add(fileContent,  "file",       filename);
+            multipart.Add(new StringContent(projectId), "project_id");
+            multipart.Add(new StringContent(cmbDocAuthority.SelectedItem?.ToString() ?? "Informational"), "authority_level");
+            multipart.Add(new StringContent(cmbDocType.SelectedItem?.ToString()      ?? "other"),          "document_type");
+            multipart.Add(new StringContent(cmbDocFinality.SelectedItem?.ToString()  ?? "final"),           "finality");
+
+            var resp = await _http.PostAsync("documents/ingest-pdf", multipart);
+
+            if (!resp.IsSuccessStatusCode)
+            {
+                var err = await resp.Content.ReadAsStringAsync();
+                // Surface the server's detail message (e.g. "PDF may be scanned/image-only")
+                string detail = err;
+                try
+                {
+                    using var errDoc = JsonDocument.Parse(err);
+                    if (errDoc.RootElement.TryGetProperty("detail", out var d))
+                        detail = d.GetString() ?? err;
+                }
+                catch { /* use raw body */ }
+                MessageBox.Show($"PDF ingestion failed:\n\n{detail}",
+                    "Ingestion Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            using var result = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+            var root  = result.RootElement;
+            string jobId  = root.GetProperty("job_id").GetString() ?? "";
+            int    pages  = root.TryGetProperty("pages",  out var pv) ? pv.GetInt32()  : 0;
+            int    chars  = root.TryGetProperty("chars",  out var cv) ? cv.GetInt32()  : 0;
+            string? sidecar = root.TryGetProperty("sidecar", out var sv) && sv.ValueKind == JsonValueKind.String
+                              ? sv.GetString() : null;
+
+            string msg = $"PDF ingested successfully.\n\nFile:   {filename}\nPages:  {pages}\nChars:  {chars:N0}\nJob ID: {jobId}\n\n" +
+                         "Chunking and embedding will complete in the background.";
+            if (!string.IsNullOrEmpty(sidecar))
+                msg += $"\n\nMarkdown sidecar saved to:\n{sidecar}";
+
+            MessageBox.Show(msg, "PDF Ingestion Queued", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        private async void BtnMoveDoc_Click(object? sender, EventArgs e)
+        {
+            if (string.IsNullOrEmpty(_selectedDocId))
+            { MessageBox.Show("Select a document first."); return; }
+
+            // Fetch all projects to populate the picker
+            List<(string Id, string Name)> projects;
+            try
+            {
+                var json = await _http.GetStringAsync("projects");
+                using var doc = JsonDocument.Parse(json);
+                projects = doc.RootElement.EnumerateArray()
+                    .Where(p => p.TryGetProperty("status", out var s) && s.GetString() == "active")
+                    .Select(p => (
+                        Id:   p.GetProperty("id").GetString()   ?? "",
+                        Name: p.GetProperty("name").GetString() ?? ""))
+                    .Where(p => p.Id.Length > 0)
+                    .ToList();
+            }
+            catch (Exception ex) { ShowError($"Could not load projects: {ex.Message}"); return; }
+
+            if (projects.Count == 0)
+            { MessageBox.Show("No active projects found."); return; }
+
+            var dlg = new Form
+            {
+                Text = "Move Document to Project",
+                Size = new System.Drawing.Size(320, 150),
+                StartPosition = FormStartPosition.CenterParent,
+                FormBorderStyle = FormBorderStyle.FixedDialog,
+                MaximizeBox = false, MinimizeBox = false,
+                BackColor = Color.FromArgb(35, 35, 35), ForeColor = Color.White
+            };
+            var lbl = new Label { Text = "Select target project:", Location = new Point(12, 14), AutoSize = true, ForeColor = Color.Silver };
+            var cmb = new ComboBox
+            {
+                Location = new Point(12, 34), Size = new Size(278, 24),
+                DropDownStyle = ComboBoxStyle.DropDownList
+            };
+            foreach (var (_, name) in projects) cmb.Items.Add(name);
+            cmb.SelectedIndex = 0;
+
+            var btnOk     = new Button { Text = "Move",   DialogResult = DialogResult.OK,     Location = new Point(130, 70), Size = new Size(75, 28) };
+            var btnCancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Location = new Point(215, 70), Size = new Size(75, 28) };
+            dlg.Controls.AddRange(new Control[] { lbl, cmb, btnOk, btnCancel });
+            dlg.AcceptButton = btnOk; dlg.CancelButton = btnCancel;
+
+            if (dlg.ShowDialog(this) != DialogResult.OK) return;
+
+            var (targetId, targetName) = projects[cmb.SelectedIndex];
+            await MoveDocAsync(_selectedDocId, targetId, targetName);
+        }
+
+        private async Task MoveDocAsync(string docId, string targetProjectId, string targetProjectName)
+        {
+            try
+            {
+                var body = JsonSerializer.Serialize(new { project_id = targetProjectId });
+                var resp = await _http.PatchAsync(
+                    $"documents/{docId}/project",
                     new StringContent(body, Encoding.UTF8, "application/json"));
                 resp.EnsureSuccessStatusCode();
-                var result = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
-                string jobId = result.RootElement.GetProperty("job_id").GetString() ?? "";
-                MessageBox.Show($"Ingestion job queued.\nJob ID: {jobId}\n\nChunking and embedding will complete in the background.",
-                    "Ingestion Queued", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 await RefreshDocsAsync();
+                MessageBox.Show(
+                    $"Document moved to \"{targetProjectName}\".\n\nNote: promoted memory notes are preserved in their original project.",
+                    "Moved", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex) { ShowError(ex.Message); }
+        }
+
+        private void BtnEditDocMeta_Click(object? sender, EventArgs e)
+        {
+            if (string.IsNullOrEmpty(_selectedDocId))
+            { MessageBox.Show("Select a document first."); return; }
+
+            // Tiny editor dialog
+            var dlg = new Form
+            {
+                Text = "Edit Document Metadata",
+                Size = new System.Drawing.Size(340, 230),
+                StartPosition = FormStartPosition.CenterParent,
+                FormBorderStyle = FormBorderStyle.FixedDialog,
+                MaximizeBox = false, MinimizeBox = false,
+                BackColor = Color.FromArgb(35, 35, 35), ForeColor = Color.White
+            };
+            var lblA = new Label { Text = "Authority Level", Location = new Point(12,  14), AutoSize = true, ForeColor = Color.Silver };
+            var cmbA = new ComboBox { Location = new Point(12, 32), Size = new Size(290, 24), DropDownStyle = ComboBoxStyle.DropDownList };
+            cmbA.Items.AddRange(new object[] { "Definitive", "Authoritative", "Informational", "Contextual", "Anecdotal" });
+            cmbA.SelectedItem = cmbDocAuthority.SelectedItem ?? "Informational";
+
+            var lblT = new Label { Text = "Document Type", Location = new Point(12, 62), AutoSize = true, ForeColor = Color.Silver };
+            var cmbT = new ComboBox { Location = new Point(12, 80), Size = new Size(290, 24), DropDownStyle = ComboBoxStyle.DropDownList };
+            cmbT.Items.AddRange(new object[] { "published_framework", "operational_guide", "strategic_draft", "meeting_notes", "planning_discussion", "other" });
+            cmbT.SelectedItem = cmbDocType.SelectedItem ?? "other";
+
+            var lblF = new Label { Text = "Finality", Location = new Point(12, 110), AutoSize = true, ForeColor = Color.Silver };
+            var cmbF = new ComboBox { Location = new Point(12, 128), Size = new Size(290, 24), DropDownStyle = ComboBoxStyle.DropDownList };
+            cmbF.Items.AddRange(new object[] { "final", "draft", "provisional" });
+            cmbF.SelectedItem = cmbDocFinality.SelectedItem ?? "final";
+
+            var btnOk     = new Button { Text = "Save",   DialogResult = DialogResult.OK,     Location = new Point(140, 160), Size = new Size(75, 28) };
+            var btnCancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Location = new Point(225, 160), Size = new Size(75, 28) };
+            dlg.Controls.AddRange(new Control[] { lblA, cmbA, lblT, cmbT, lblF, cmbF, btnOk, btnCancel });
+            dlg.AcceptButton = btnOk; dlg.CancelButton = btnCancel;
+
+            if (dlg.ShowDialog(this) != DialogResult.OK) return;
+
+            string auth     = cmbA.SelectedItem?.ToString() ?? "Informational";
+            string purpose  = cmbT.SelectedItem?.ToString() ?? "other";
+            string finality = cmbF.SelectedItem?.ToString() ?? "final";
+            _ = PatchDocMetaAsync(_selectedDocId, auth, purpose, finality);
+        }
+
+        private async Task PatchDocMetaAsync(string docId, string auth, string docType, string finality)
+        {
+            try
+            {
+                var body = JsonSerializer.Serialize(new
+                {
+                    authority_level = auth,
+                    document_type   = docType,
+                    finality
+                });
+                var resp = await _http.PatchAsync(
+                    $"documents/{docId}/metadata",
+                    new StringContent(body, Encoding.UTF8, "application/json"));
+                resp.EnsureSuccessStatusCode();
+                await RefreshDocsAsync();
+                MessageBox.Show("Metadata updated.", "Saved", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
             catch (Exception ex) { ShowError(ex.Message); }
         }

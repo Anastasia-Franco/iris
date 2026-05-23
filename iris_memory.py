@@ -204,6 +204,10 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         # Research trace — structured metadata for the Research Trace tab
         ("research_cache",    "trace_json TEXT"),
         ("research_cache",    "model TEXT"),
+        # Epistemic authority — document-level synthesis weighting
+        ("documents",         "authority_level TEXT NOT NULL DEFAULT 'Informational'"),
+        ("documents",         "document_type TEXT NOT NULL DEFAULT 'other'"),
+        ("documents",         "finality TEXT NOT NULL DEFAULT 'final'"),
     ]
     for table, col_def in migrations:
         try:
@@ -562,26 +566,34 @@ def add_document(
     file_path: str = None,
     doc_type: str = "markdown",
     raw_content: str = None,
+    authority_level: str = "Informational",
+    document_type: str = "other",
+    finality: str = "final",
 ) -> str:
     doc_id = str(uuid.uuid4())
     conn.execute(
-        """INSERT INTO documents (id, project_id, filename, file_hash, file_path, doc_type, ingested_at, chunk_count, raw_content)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)""",
-        (doc_id, project_id, filename, file_hash, file_path, doc_type, _now(), raw_content),
+        """INSERT INTO documents
+               (id, project_id, filename, file_hash, file_path, doc_type,
+                ingested_at, chunk_count, raw_content,
+                authority_level, document_type, finality)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)""",
+        (doc_id, project_id, filename, file_hash, file_path, doc_type,
+         _now(), raw_content, authority_level, document_type, finality),
     )
     conn.commit()
     return doc_id
 
 
 def get_documents(conn: sqlite3.Connection, project_id: str = None) -> list[dict]:
+    cols = "id, project_id, filename, file_hash, doc_type, ingested_at, chunk_count, authority_level, document_type, finality"
     if project_id:
         cursor = conn.execute(
-            "SELECT id, project_id, filename, file_hash, doc_type, ingested_at, chunk_count FROM documents WHERE project_id = ? ORDER BY ingested_at DESC",
+            f"SELECT {cols} FROM documents WHERE project_id = ? ORDER BY ingested_at DESC",
             (project_id,),
         )
     else:
         cursor = conn.execute(
-            "SELECT id, project_id, filename, file_hash, doc_type, ingested_at, chunk_count FROM documents ORDER BY ingested_at DESC"
+            f"SELECT {cols} FROM documents ORDER BY ingested_at DESC"
         )
     return [dict(row) for row in cursor.fetchall()]
 
@@ -621,17 +633,108 @@ def update_document_chunk_count(
 
 
 def delete_document(conn: sqlite3.Connection, doc_id: str) -> None:
-    """Delete a document and its chunks; also removes associated embeddings."""
+    """Governed cascading deletion of a document and all its ingestion artifacts.
+
+    Deletion order (FK-safe, foreign_keys=ON):
+      1. Embeddings for this document's chunks  (soft ref — no FK)
+      2. ingestion_jobs for this document       (hard FK, no CASCADE defined)
+      3. document_chunks                        (hard FK, ON DELETE CASCADE would
+                                                 also fire, but explicit is safer)
+      4. document row itself
+
+    Durable memory notes that were promoted from this document are PRESERVED.
+    Only their provenance links (source_document_id / source_chunk_id) are
+    nulled out so the notes remain valid standalone knowledge.
+    """
+    # 1. Collect chunk IDs for embedding cleanup before chunks are gone
     chunk_ids = [row["id"] for row in get_document_chunks(conn, doc_id)]
+
+    # 2. Delete retrieval embeddings (soft reference — not a FK, but must go first
+    #    so the search index stays consistent)
     if chunk_ids:
         placeholders = ",".join("?" * len(chunk_ids))
         conn.execute(
-            f"DELETE FROM embeddings WHERE source_id IN ({placeholders}) AND source_type = 'document_chunk'",
+            f"DELETE FROM embeddings WHERE source_id IN ({placeholders})"
+            f" AND source_type = 'document_chunk'",
             chunk_ids,
         )
+
+    # 3. Sever provenance links on durable memory notes — preserve the notes
+    #    themselves (operator-approved synthesized knowledge must survive source
+    #    document deletion)
+    conn.execute(
+        "UPDATE memory_notes SET source_document_id = NULL WHERE source_document_id = ?",
+        (doc_id,),
+    )
+    if chunk_ids:
+        placeholders = ",".join("?" * len(chunk_ids))
+        conn.execute(
+            f"UPDATE memory_notes SET source_chunk_id = NULL"
+            f" WHERE source_chunk_id IN ({placeholders})",
+            chunk_ids,
+        )
+
+    # 4. Remove ingestion job records (hard FK, no ON DELETE CASCADE)
+    conn.execute("DELETE FROM ingestion_jobs WHERE document_id = ?", (doc_id,))
+
+    # 5. Remove chunks (ON DELETE CASCADE would also fire on the next step, but
+    #    doing it explicitly keeps the order deterministic)
     conn.execute("DELETE FROM document_chunks WHERE document_id = ?", (doc_id,))
+
+    # 6. Remove the document row — all dependents are gone
     conn.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
     conn.commit()
+
+
+def move_document_project(
+    conn: sqlite3.Connection,
+    doc_id: str,
+    new_project_id: str,
+) -> bool:
+    """Move a document (and all its ingestion artifacts) to a different project.
+
+    Updates project_id on:
+      - documents
+      - document_chunks  (search uses chunk-level project_id for filtering)
+      - embeddings        (semantic search filters on this column)
+      - ingestion_jobs    (housekeeping)
+
+    Durable memory notes that were promoted from this document are NOT moved —
+    they belong to the knowledge graph, not to the source document lifecycle.
+
+    Returns True if the document was found and moved, False if not found.
+    """
+    row = conn.execute("SELECT id FROM documents WHERE id = ?", (doc_id,)).fetchone()
+    if not row:
+        return False
+
+    chunk_ids = [r["id"] for r in get_document_chunks(conn, doc_id)]
+
+    # Update document row
+    conn.execute(
+        "UPDATE documents SET project_id = ? WHERE id = ?",
+        (new_project_id, doc_id),
+    )
+    # Update chunk project_ids
+    conn.execute(
+        "UPDATE document_chunks SET project_id = ? WHERE document_id = ?",
+        (new_project_id, doc_id),
+    )
+    # Update embedding project_ids (soft reference via source_id + source_type)
+    if chunk_ids:
+        placeholders = ",".join("?" * len(chunk_ids))
+        conn.execute(
+            f"UPDATE embeddings SET project_id = ? WHERE source_type = 'document_chunk'"
+            f" AND source_id IN ({placeholders})",
+            [new_project_id, *chunk_ids],
+        )
+    # Update ingestion job project_ids
+    conn.execute(
+        "UPDATE ingestion_jobs SET project_id = ? WHERE document_id = ?",
+        (new_project_id, doc_id),
+    )
+    conn.commit()
+    return True
 
 
 # ---------------------------------------------------------------------------

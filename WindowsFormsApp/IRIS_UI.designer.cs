@@ -63,6 +63,7 @@ namespace WindowsFormsApp
             txtPrompt.Location = new Point(0, 349);
             txtPrompt.Margin = new Padding(4, 3, 4, 3);
             txtPrompt.Multiline = true;
+            txtPrompt.ScrollBars = ScrollBars.Vertical;
             txtPrompt.Name = "txtPrompt";
             txtPrompt.Size = new Size(933, 100);
             txtPrompt.TabIndex = 0;

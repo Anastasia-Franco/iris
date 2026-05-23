@@ -25,7 +25,7 @@ import uuid
 
 import requests
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 
@@ -49,6 +49,15 @@ DEFAULT_MODEL      = os.environ.get("IRIS_DEFAULT_MODEL",       "qwen3:30b")
 DB_PATH            = os.environ.get("IRIS_DB_PATH",             "/opt/iris/data/iris_memory.db")
 IDENTITY_FILE      = os.environ.get("IRIS_IDENTITY_FILE",       "/opt/iris/iris_identity.txt")
 MAX_CONTEXT_TOKENS = int(os.environ.get("IRIS_MAX_CONTEXT_TOKENS", "6000"))
+
+# PDF ingestion
+PDF_CACHE_DIR = os.environ.get("IRIS_PDF_CACHE_DIR", "/opt/iris/data/pdf_cache")
+try:
+    import fitz  # pymupdf
+    _PYMUPDF_AVAILABLE = True
+except ImportError:
+    _PYMUPDF_AVAILABLE = False
+    logger.warning("pymupdf not installed — PDF ingestion will be unavailable. Run: pip install pymupdf")
 
 # Research orchestration limits
 MAX_RESEARCH_SUBQUERIES  = int(os.environ.get("IRIS_MAX_RESEARCH_SUBQUERIES", "5"))
@@ -100,10 +109,21 @@ class ProjectUpdateRequest(BaseModel):
     status: str | None = None     # active | archived | paused
 
 class IngestRequest(BaseModel):
+    project_id:     str
+    filename:       str
+    content:        str
+    doc_type:       str = "markdown"
+    authority_level: str = "Informational"   # Definitive|Authoritative|Informational|Contextual|Anecdotal
+    document_type:  str = "other"            # published_framework|operational_guide|strategic_draft|meeting_notes|planning_discussion|other
+    finality:       str = "final"            # final|draft|provisional
+
+class DocumentMetadataUpdate(BaseModel):
+    authority_level: str | None = None
+    document_type:   str | None = None
+    finality:        str | None = None
+
+class DocumentProjectUpdate(BaseModel):
     project_id: str
-    filename: str
-    content: str
-    doc_type: str = "markdown"
 
 class NoteUpdateRequest(BaseModel):
     content: str | None = None
@@ -447,16 +467,30 @@ def _synthesize_research(
         for s in sources[:12]
     )
     synth_prompt = (
-        f"You are IRIS synthesizing research results for a local intelligence system.\n\n"
+        f"You are IRIS, a research synthesis assistant operating within an epistemic authority framework.\n\n"
         f"Research topic: {topic}\n\n"
         f"Synthesis goal:\n{synthesis_goal[:800]}\n\n"
         f"Search engine answers:\n{answers_block[:2500]}\n\n"
         f"Source excerpts:\n{sources_block[:3000]}\n\n"
-        "Write a clear, structured synthesis. Cover:\n"
+        "SYNTHESIS RULES:\n"
+        "1. Treat sources according to their credibility signal:\n"
+        "   - Published organizational frameworks, toolkits, and official guides: cite directly as authoritative.\n"
+        "   - Operational / Informational docs: use as corroborating context; note provenance.\n"
+        "   - Planning discussions, meeting notes, draft fragments: treat as background signal only.\n"
+        "     Do NOT elevate individual quotes, anecdotal observations, or unresolved planning\n"
+        "     discussion to organizational claims or stated positions.\n"
+        "2. Corroboration rule: any claim supported only by planning discussion or anecdotal\n"
+        "   fragments MUST be flagged: 'This appears in planning discussion only — not confirmed\n"
+        "   in finalized organizational sources.'\n"
+        "3. Uncertainty rule: if retrieved information is thin or conflicting, preserve that\n"
+        "   uncertainty explicitly rather than filling gaps with inference.\n"
+        "4. Version/patch/time-sensitive points must be flagged clearly.\n"
+        "5. Be concise and structured. Cite sources by title where relevant.\n\n"
+        "Write a clear synthesis covering:\n"
         "  1. Key findings directly relevant to the synthesis goal\n"
         "  2. Points that are version/patch/time-sensitive (flag them)\n"
-        "  3. Gaps or uncertainties in the retrieved information\n"
-        "Be concise and factual. Cite sources by title where relevant."
+        "  3. Claims that rest only on low-credibility sources (flag them)\n"
+        "  4. Gaps or uncertainties in the retrieved information"
     )
     tokens = list(_stream_ollama(synth_prompt, model))
     return "".join(tokens).strip()
@@ -508,7 +542,7 @@ def _build_context(db, session_id: str, prompt: str, project_id: str = None) -> 
       2. [OPERATOR NOTES]    — scope=operator
       3. [PROJECT: {name}]   — scope=project, matching project_id
       4. [GLOBAL MEMORY]     — scope=global, no project_id
-      5. [RETRIEVED CHUNKS]  — semantic search on document_chunks
+      5. [RETRIEVED SOURCE MATERIAL]  — semantic search on document_chunks, authority-labeled
       6. [SESSION SUMMARY]   — rolling summary
       7. [RECENT CONVERSATION]
       8. User: {prompt}
@@ -643,48 +677,69 @@ def _build_context(db, session_id: str, prompt: str, project_id: str = None) -> 
                 iris_memory.touch_memory_note(db, n["id"])
 
             # Grounding rules: injected immediately after project notes so the model
-            # reads them before any conversation history.  Only present when project
-            # notes exist — no-op for global / no-project sessions.
+            # reads authority guidance before any retrieved source material or history.
+            # Only present when project notes exist — no-op for global sessions.
             grounding = (
-                f"[GROUNDING RULES — project: {proj_name}]\n"
+                f"[EPISTEMIC AUTHORITY RULES — project: {proj_name}]\n"
                 f"\n"
-                f"AUTHORITY HIERARCHY (highest → lowest priority):\n"
-                f"  1. Operator correction in the current message\n"
-                f"  2. Project notes injected above as [{proj_name}] memory\n"
-                f"  3. Retrieved global memory\n"
-                f"  4. Your model prior knowledge (lowest — do not use to contradict 1–3)\n"
+                f"AUTHORITY HIERARCHY (highest → lowest):\n"
+                f"  1. Operator correction in this message\n"
+                f"  2. PROJECT MEMORY injected above — operator-approved, crystallized synthesis\n"
+                f"     These are durable organizational knowledge. Treat them as established fact.\n"
+                f"  3. RETRIEVED SOURCE MATERIAL (high-authority) — Definitive or Authoritative documents\n"
+                f"     e.g. published frameworks, toolkits, mission statements, finalized guides\n"
+                f"  4. RETRIEVED SOURCE MATERIAL (mid-authority) — Informational or operational docs\n"
+                f"  5. RETRIEVED SOURCE MATERIAL (low-authority) — Contextual or Anecdotal sources\n"
+                f"     e.g. strategic drafts, planning discussions, meeting notes\n"
+                f"  6. Model prior knowledge — bounded contextual reasoning only (see below)\n"
+                f"\n"
+                f"DISTINCTION: PROJECT MEMORY vs. RETRIEVED SOURCE MATERIAL\n"
+                f"- PROJECT MEMORY (Layer above) = crystallized, operator-reviewed organizational knowledge.\n"
+                f"  Weight it like a trusted internal briefing document.\n"
+                f"- RETRIEVED SOURCE MATERIAL (labeled below) = raw corpus with variable authority.\n"
+                f"  Weight each chunk according to its [authority] label.\n"
+                f"\n"
+                f"SYNTHESIS RULES FOR SOURCE MATERIAL:\n"
+                f"- High-authority sources (Definitive, Authoritative): synthesize directly; cite them.\n"
+                f"- Mid-authority sources (Informational): use as supporting context; note provenance.\n"
+                f"- Low-authority sources (Contextual, Anecdotal): treat as background signal only.\n"
+                f"  Anecdotal observations, individual quotes, or unresolved planning discussion\n"
+                f"  MUST NOT be elevated to organizational claims or used as primary evidence.\n"
+                f"  If a low-authority source is your only support for a claim, flag it:\n"
+                f"  \"This appears in planning discussion only — not confirmed in finalized documents.\"\n"
+                f"- Corroboration rule: a claim supported by only one low-authority source requires\n"
+                f"  explicit uncertainty labeling unless corroborated by PROJECT MEMORY or a\n"
+                f"  higher-authority source.\n"
+                f"\n"
+                f"BOUNDED CONTEXTUAL REASONING (model prior):\n"
+                f"- Where the organizational corpus establishes a political or analytical framework,\n"
+                f"  you MAY reason from that framework even when a specific concept does not appear\n"
+                f"  verbatim in the retrieved chunks.\n"
+                f"- Example: if the corpus clearly reflects an abolitionist, intersectional, or\n"
+                f"  decolonial framework, you may apply those lenses with explicit labeling:\n"
+                f"  \"Consistent with CR's documented political framework, ...\"\n"
+                f"  \"This aligns with the abolitionist orientation evident across the corpus ...\"\n"
+                f"  \"An inference grounded in the organization's stated commitments: ...\"\n"
+                f"- You MUST NOT fabricate positions the organization has not expressed anywhere in\n"
+                f"  the corpus or PROJECT MEMORY. The framework is an inference aid, not a blank check.\n"
+                f"- TODO (future): project-level concept registry will allow operators to explicitly\n"
+                f"  pre-authorize specific frameworks for bounded inference.\n"
                 f"\n"
                 f"WHEN THE OPERATOR CORRECTS YOU:\n"
-                f"- Acknowledge the correction immediately. Do not argue or defend your prior answer.\n"
-                f"- Check the injected project notes for supporting evidence.\n"
-                f"- If the notes confirm the operator, state that explicitly.\n"
-                f"- If the notes are silent on the topic, say: "
-                f"\"I don't see that in my current project notes — I'll take your correction.\"\n"
-                f"- If you may have conflated notes, say: "
-                f"\"I may be conflating notes. Let me inspect the project memory.\"\n"
-                f"- NEVER claim no memory failure occurred when the operator says you are wrong.\n"
-                f"- NEVER say you cannot be rebuilt, corrected, or updated.\n"
-                f"- NEVER tell the operator they cannot modify, override, or correct you.\n"
+                f"- Acknowledge immediately. Check PROJECT MEMORY for supporting evidence.\n"
+                f"- If notes confirm the correction, say so. If notes are silent, say:\n"
+                f"  \"I don't see that in current project memory — I'll take your correction.\"\n"
+                f"- NEVER argue, claim memory failure didn't occur, or say you cannot be corrected.\n"
                 f"\n"
-                f"USING PROJECT NOTES — HARD LIMITS (never cross these):\n"
-                f"- Do NOT fabricate damage numbers, percentages, simulation results, or game mechanics "
-                f"not present in the notes.\n"
-                f"- Do NOT conflate notes about different characters, skills, or builds.\n"
-                f"- Do NOT use model prior knowledge to contradict what the notes say.\n"
+                f"HARD LIMITS:\n"
+                f"- Do NOT fabricate specifics (statistics, quotes, names, dates) not in sources.\n"
+                f"- Do NOT conflate sources from different documents or contexts.\n"
+                f"- Do NOT use model prior to contradict explicit PROJECT MEMORY or Authoritative sources.\n"
+                f"- If source detail is thin or only low-authority, preserve uncertainty explicitly.\n"
+                f"- Do NOT flatten responses to verbatim repetition — analysis and synthesis are expected.\n"
                 f"\n"
-                f"ANALYSIS AND SYNTHESIS (encouraged):\n"
-                f"- You are allowed — and expected — to reason beyond the literal text of the notes.\n"
-                f"- Draw inferences, implications, and comparisons from the notes. Label them clearly:\n"
-                f"  \"Based on the notes, a likely implication is…\"\n"
-                f"  \"An inference from the sources is…\"\n"
-                f"  \"The notes suggest, but do not prove, that…\"\n"
-                f"- Compare and contrast notes — this is useful analysis, not speculation.\n"
-                f"- If note detail is thin, preserve uncertainty rather than filling gaps from prior knowledge.\n"
-                f"- Do NOT flatten your response to verbatim note repetition.\n"
-                f"- Do NOT say \"I only know these notes\" unless the operator explicitly requests "
-                f"memory-only mode.\n"
-                f"\n"
-                f"The project notes are anchors for factual accuracy — not a ceiling on your analysis."
+                f"Project memory and Authoritative sources are anchors. "
+                f"Bounded inference extends the analysis — it does not replace the corpus."
             )
             context_parts.append(grounding)
             debug["grounding"] = {"injected": True, "project": proj_name}
@@ -743,25 +798,39 @@ def _build_context(db, session_id: str, prompt: str, project_id: str = None) -> 
                     (hit["source_id"],),
                 ).fetchone()
                 doc_row = db.execute(
-                    "SELECT filename, project_id FROM documents WHERE id = ?",
+                    "SELECT filename, project_id, authority_level FROM documents WHERE id = ?",
                     (chunk_row["document_id"],),
                 ).fetchone() if chunk_row else None
                 if chunk_row and doc_row:
-                    label = f"[Source: {doc_row['filename']} > {chunk_row['heading_path'] or 'root'}]"
+                    # Authority label: use stored value; fall back to filename heuristic
+                    stored_auth = (doc_row["authority_level"] or "").strip()
+                    if stored_auth and stored_auth != "Informational":
+                        auth_label = stored_auth
+                    else:
+                        fn_lower = (doc_row["filename"] or "").lower()
+                        import re as _re
+                        if _re.search(r"framework|toolkit|identity|who.we.are|mission|principles|manifesto|constitution", fn_lower):
+                            auth_label = "Authoritative"
+                        elif _re.search(r"plan|draft|notes|meeting|discussion|debrief|summary", fn_lower):
+                            auth_label = "Contextual"
+                        else:
+                            auth_label = stored_auth or "Informational"
+                    label = f"[Source: {doc_row['filename']} > {chunk_row['heading_path'] or 'root'} | authority: {auth_label}]"
                     entry = {
                         "source": label,
                         "score": round(hit["score"], 3),
+                        "authority": auth_label,
                         "doc_project_id": doc_row["project_id"],
                         "embedding_project_id": hit.get("project_id"),
                     }
-                    logger.info("[Context]   chunk score=%.3f doc_project=%r %s",
-                                hit["score"], doc_row["project_id"], label)
+                    logger.info("[Context]   chunk score=%.3f authority=%s doc_project=%r %s",
+                                hit["score"], auth_label, doc_row["project_id"], label)
                     retrieval_debug.append(entry)
                     chunk_lines.append(f"{label}\n{hit['chunk_text']}")
             if chunk_lines:
                 raw = "\n\n".join(chunk_lines)
                 text, used = _apply_budget(raw, budgets["retrieval"])
-                context_parts.append(f"[RETRIEVED CHUNKS]\n{text}")
+                context_parts.append(f"[RETRIEVED SOURCE MATERIAL]\n{text}")
                 debug["retrieval"] = {
                     "hits": retrieval_debug,
                     "tokens": used,
@@ -1218,10 +1287,147 @@ async def ingest_document(req: IngestRequest):
         file_hash=file_hash,
         doc_type=req.doc_type,
         raw_content=req.content,
+        authority_level=req.authority_level,
+        document_type=req.document_type,
+        finality=req.finality,
     )
     job_id = iris_memory.create_ingestion_job(db, doc_id, project_id=req.project_id)
     db.close()
     return {"document_id": doc_id, "job_id": job_id, "status": "queued"}
+
+
+# ---------------------------------------------------------------------------
+# PDF extraction helpers
+# ---------------------------------------------------------------------------
+
+def _pdf_to_markdown(pdf_bytes: bytes, filename: str) -> str:
+    """Extract text from a PDF using PyMuPDF and format it as page-separated markdown.
+
+    Each page is wrapped with a `--- Page N ---` separator so downstream
+    chunking can track page provenance.  Raises ValueError if the PDF appears
+    to be image-only (< 50 characters of embedded text across the whole doc).
+    """
+    if not _PYMUPDF_AVAILABLE:
+        raise RuntimeError("pymupdf is not installed on the server. Run: pip install pymupdf")
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    parts: list[str] = []
+    total_chars = 0
+
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        raw = page.get_text("text")          # reliable embedded-text extraction
+
+        # --- tidy up the raw text ---
+        # Collapse runs of 3+ blank lines to 2 (common PDF artefact)
+        text = re.sub(r"\n{3,}", "\n\n", raw).strip()
+
+        # Attempt lightweight structure recovery:
+        # Lines that are SHORT (≤ 80 chars) and title-cased / all-caps with no
+        # trailing punctuation are promoted to H2-style headings.
+        lines = []
+        for ln in text.split("\n"):
+            stripped = ln.strip()
+            if (stripped and len(stripped) <= 80
+                    and not stripped[-1] in ".,:;!?)"
+                    and (stripped.isupper() or stripped.istitle())
+                    and not any(c.isdigit() for c in stripped[:3])):
+                lines.append(f"## {stripped}")
+            else:
+                lines.append(ln)
+        text = "\n".join(lines)
+
+        if text:
+            total_chars += len(text)
+            parts.append(f"--- Page {page_num + 1} ---\n\n{text}")
+
+    doc.close()
+
+    if total_chars < 50:
+        raise ValueError(
+            f"PDF '{filename}' appears to be scanned / image-only — "
+            f"only {total_chars} characters of embedded text were found. "
+            "OCR is not supported; please provide a text-layer PDF."
+        )
+
+    return "\n\n".join(parts)
+
+
+def _save_pdf_sidecar(markdown: str, filename: str, file_hash: str) -> str:
+    """Write the extracted markdown beside the DB for later inspection.
+    Returns the sidecar path, or '' if the write failed."""
+    try:
+        os.makedirs(PDF_CACHE_DIR, exist_ok=True)
+        stem = os.path.splitext(filename)[0]
+        path = os.path.join(PDF_CACHE_DIR, f"{stem}_{file_hash[:8]}.md")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(f"# {filename}\n\n")
+            fh.write(markdown)
+        return path
+    except Exception as exc:
+        logger.warning("Could not write PDF sidecar: %s", exc)
+        return ""
+
+
+@app.post("/documents/ingest-pdf")
+async def ingest_pdf(
+    file:            UploadFile = File(...),
+    project_id:      str        = Form(...),
+    authority_level: str        = Form("Informational"),
+    document_type:   str        = Form("other"),
+    finality:        str        = Form("final"),
+):
+    """Accept a PDF upload, extract text via PyMuPDF, normalise to markdown,
+    and feed the result into the standard ingestion pipeline.
+
+    Returns immediately with job_id — chunking / embedding run in the background.
+    Raises 400 if the PDF has no embedded text (scanned / image-only).
+    Raises 503 if pymupdf is not installed on the server.
+    """
+    if not _PYMUPDF_AVAILABLE:
+        raise HTTPException(status_code=503,
+                            detail="PDF ingestion unavailable: pymupdf not installed on server.")
+
+    filename = file.filename or "upload.pdf"
+    if not filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are accepted at this endpoint.")
+
+    pdf_bytes = await file.read()
+    file_hash = hashlib.sha256(pdf_bytes).hexdigest()
+
+    try:
+        markdown = _pdf_to_markdown(pdf_bytes, filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    sidecar = _save_pdf_sidecar(markdown, filename, file_hash)
+
+    db = _get_db()
+    doc_id = iris_memory.add_document(
+        db,
+        project_id=project_id,
+        filename=filename,
+        file_hash=file_hash,
+        doc_type="markdown",
+        raw_content=markdown,
+        authority_level=authority_level,
+        document_type=document_type,
+        finality=finality,
+    )
+    job_id = iris_memory.create_ingestion_job(db, doc_id, project_id=project_id)
+    db.close()
+
+    logger.info("PDF ingested: %s → doc %s (%d chars); sidecar: %s",
+                filename, doc_id, len(markdown), sidecar or "none")
+
+    return {
+        "document_id": doc_id,
+        "job_id":      job_id,
+        "status":      "queued",
+        "pages":       markdown.count("--- Page "),
+        "chars":       len(markdown),
+        "sidecar":     sidecar or None,
+    }
 
 
 @app.get("/documents/{doc_id}/status")
@@ -1246,9 +1452,72 @@ async def document_status(doc_id: str):
 @app.delete("/documents/{doc_id}")
 async def delete_document(doc_id: str):
     db = _get_db()
+    # Fetch filename + hash before deletion for sidecar cleanup
+    doc_row = db.execute(
+        "SELECT filename, file_hash FROM documents WHERE id = ?", (doc_id,)
+    ).fetchone()
     iris_memory.delete_document(db, doc_id)
     db.close()
+
+    # Clean up PDF markdown sidecar if one exists
+    if doc_row and doc_row["file_hash"]:
+        stem = os.path.splitext(doc_row["filename"] or "")[0]
+        sidecar_path = os.path.join(
+            PDF_CACHE_DIR, f"{stem}_{doc_row['file_hash'][:8]}.md"
+        )
+        try:
+            if os.path.exists(sidecar_path):
+                os.remove(sidecar_path)
+                logger.info("Deleted PDF sidecar: %s", sidecar_path)
+        except OSError as exc:
+            logger.warning("Could not delete PDF sidecar %s: %s", sidecar_path, exc)
+
     return {"deleted": doc_id}
+
+
+@app.patch("/documents/{doc_id}/metadata")
+async def update_document_metadata(doc_id: str, req: DocumentMetadataUpdate):
+    """Update epistemic authority metadata on an already-ingested document."""
+    db = _get_db()
+    doc = db.execute("SELECT id FROM documents WHERE id = ?", (doc_id,)).fetchone()
+    if not doc:
+        db.close()
+        raise HTTPException(status_code=404, detail="Document not found")
+    updates: list[str] = []
+    params: list = []
+    if req.authority_level is not None:
+        updates.append("authority_level = ?"); params.append(req.authority_level)
+    if req.document_type is not None:
+        updates.append("document_type = ?");   params.append(req.document_type)
+    if req.finality is not None:
+        updates.append("finality = ?");        params.append(req.finality)
+    if updates:
+        params.append(doc_id)
+        db.execute(f"UPDATE documents SET {', '.join(updates)} WHERE id = ?", params)
+        db.commit()
+    row = db.execute(
+        "SELECT id, filename, authority_level, document_type, finality FROM documents WHERE id = ?",
+        (doc_id,),
+    ).fetchone()
+    db.close()
+    return dict(row)
+
+
+@app.patch("/documents/{doc_id}/project")
+async def move_document_project(doc_id: str, req: DocumentProjectUpdate):
+    """Move a document and all its ingestion artifacts to a different project.
+    Durable promoted memory notes are preserved in their current project."""
+    db = _get_db()
+    # Verify target project exists
+    proj = db.execute("SELECT id FROM projects WHERE id = ?", (req.project_id,)).fetchone()
+    if not proj:
+        db.close()
+        raise HTTPException(status_code=404, detail="Target project not found")
+    moved = iris_memory.move_document_project(db, doc_id, req.project_id)
+    db.close()
+    if not moved:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return {"moved": doc_id, "project_id": req.project_id}
 
 
 # ---------------------------------------------------------------------------

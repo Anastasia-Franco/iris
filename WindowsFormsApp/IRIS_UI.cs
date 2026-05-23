@@ -20,6 +20,8 @@ namespace WindowsFormsApp
         private string _currentProjectId = "";
         private StringBuilder _streamBuffer = new();
         private string _preambleRtf = "";
+        private bool _inThinkBlock = false;  // tracks <think> block state across stream chunks
+        private string _lastCleanResponse = "";  // last response, think-blocks stripped, for export
 
         // ── Spinner / cancel state ──────────────────────────────────────────────
         private bool _isResearching = false;
@@ -57,6 +59,7 @@ namespace WindowsFormsApp
             _mdH3         = new Font("Segoe UI Emoji", 13f, FontStyle.Bold);
 
             _ = LoadProjectsAsync();
+            SetupExportStrip();
         }
 
         private async System.Threading.Tasks.Task LoadProjectsAsync()
@@ -170,6 +173,15 @@ namespace WindowsFormsApp
                 txtStream.SelectionStart = txtStream.TextLength;
                 txtStream.ScrollToCaret();
             }
+            else
+            {
+                // Chat: temporary indicator — not buffered; cleared when preambleRtf is restored
+                txtStream.SelectionFont  = _mdCode;
+                txtStream.SelectionColor = Color.DimGray;
+                txtStream.AppendText("\u231b Thinking\u2026");
+                txtStream.SelectionStart = txtStream.TextLength;
+                txtStream.ScrollToCaret();
+            }
 
             var requestBody = new
             {
@@ -199,17 +211,29 @@ namespace WindowsFormsApp
                 response.EnsureSuccessStatusCode();
 
                 using var stream = await response.Content.ReadAsStreamAsync(ct);
-                var readBuffer = new byte[512];
+                // Reset display state before raw tokens arrive
+                _inThinkBlock = false;
+                txtStream.SelectionFont  = _mdDefault;
+                txtStream.SelectionColor = SystemColors.WindowText;
+                var readBuffer = new byte[4096];
                 int bytesRead;
                 while ((bytesRead = await stream.ReadAsync(
                             readBuffer, 0, readBuffer.Length, ct)) > 0)
                 {
                     var chunk = Encoding.UTF8.GetString(readBuffer, 0, bytesRead);
-                    txtStream.AppendText(chunk);
                     _streamBuffer.Append(chunk);
-                    // Auto-scroll after every chunk so progress lines are always visible
-                    txtStream.SelectionStart = txtStream.TextLength;
-                    txtStream.ScrollToCaret();
+                    // Strip <think>…</think> reasoning blocks from live display
+                    var visible = FilterThinkBlocks(chunk, ref _inThinkBlock);
+                    if (visible.Length > 0)
+                    {
+                        txtStream.AppendText(visible);
+                        // Scroll only when a newline lands — avoids per-chunk layout jitter
+                        if (visible.Contains('\n'))
+                        {
+                            txtStream.SelectionStart = txtStream.TextLength;
+                            txtStream.ScrollToCaret();
+                        }
+                    }
                 }
             }
             catch (OperationCanceledException)
@@ -230,8 +254,11 @@ namespace WindowsFormsApp
             }
 
             // Restore pre-stream RTF snapshot and render the full response as markdown.
+            // Strip any <think> blocks that accumulated in the buffer before rendering.
             txtStream.Rtf = _preambleRtf;
-            AppendMarkdown(txtStream, PreprocessMarkdown(_streamBuffer.ToString().TrimEnd()));
+            var finalText = StripThinkBlocks(_streamBuffer.ToString().TrimEnd());
+            _lastCleanResponse = finalText;
+            AppendMarkdown(txtStream, PreprocessMarkdown(finalText));
             txtStream.AppendText(Environment.NewLine + Environment.NewLine);
             txtStream.SelectionStart = txtStream.TextLength;
             txtStream.ScrollToCaret();
@@ -379,6 +406,42 @@ namespace WindowsFormsApp
 
         /// <summary>Normalize HTML fragments emitted by the model before markdown rendering.
         /// Converts &lt;br&gt; variants to newlines and decodes common HTML entities.</summary>
+        /// <summary>
+        /// Strips &lt;think&gt;…&lt;/think&gt; blocks from the completed buffer before
+        /// markdown rendering so qwen3 chain-of-thought never leaks into the output.
+        /// </summary>
+        private static string StripThinkBlocks(string text) =>
+            Regex.Replace(text, @"<think>[\s\S]*?</think>", "", RegexOptions.IgnoreCase);
+
+        /// <summary>
+        /// Filters &lt;think&gt; blocks out of a single stream chunk for live display.
+        /// State is preserved across chunks via <paramref name="inThink"/>.
+        /// </summary>
+        private static string FilterThinkBlocks(string chunk, ref bool inThink)
+        {
+            var sb = new StringBuilder();
+            int i = 0;
+            while (i < chunk.Length)
+            {
+                if (!inThink)
+                {
+                    int start = chunk.IndexOf("<think>", i, StringComparison.OrdinalIgnoreCase);
+                    if (start < 0) { sb.Append(chunk, i, chunk.Length - i); break; }
+                    if (start > i) sb.Append(chunk, i, start - i);
+                    inThink = true;
+                    i = start + 7;
+                }
+                else
+                {
+                    int end = chunk.IndexOf("</think>", i, StringComparison.OrdinalIgnoreCase);
+                    if (end < 0) break; // still inside — discard rest of chunk
+                    inThink = false;
+                    i = end + 8;
+                }
+            }
+            return sb.ToString();
+        }
+
         private static string PreprocessMarkdown(string text)
         {
             // <br>, <br/>, <br /> → newline
@@ -397,9 +460,26 @@ namespace WindowsFormsApp
         private void AppendMarkdown(RichTextBox rtb, string markdown)
         {
             bool inCodeBlock = false;
+            var tableBuffer  = new List<string>();
+
+            void FlushTable()
+            {
+                if (tableBuffer.Count == 0) return;
+                RenderMarkdownTable(rtb, tableBuffer);
+                tableBuffer.Clear();
+            }
+
             foreach (var rawLine in markdown.Split('\n'))
             {
                 var line = rawLine.TrimEnd('\r');
+
+                // ── Table row detection (pipe-delimited, not inside code blocks) ──
+                if (!inCodeBlock && line.TrimStart().StartsWith("|") && line.Count(c => c == '|') >= 2)
+                {
+                    tableBuffer.Add(line);
+                    continue;
+                }
+                FlushTable(); // emit any buffered table before processing next line
 
                 if (line.TrimStart().StartsWith("```"))
                 {
@@ -418,7 +498,7 @@ namespace WindowsFormsApp
                     continue;
                 }
 
-                if (line == "---" || line == "***" || line == "___")
+                if (Regex.IsMatch(line.Trim(), @"^[-*_]{3,}$"))
                 {
                     rtb.SelectionFont = _mdDefault;
                     rtb.SelectionColor = Color.DimGray;
@@ -426,9 +506,21 @@ namespace WindowsFormsApp
                     continue;
                 }
 
-                if (line.StartsWith("### ")) { rtb.SelectionFont = _mdH3; rtb.SelectionColor = Color.MediumSlateBlue; rtb.AppendText(line[4..] + Environment.NewLine); continue; }
-                if (line.StartsWith("## "))  { rtb.SelectionFont = _mdH2; rtb.SelectionColor = Color.MediumSlateBlue; rtb.AppendText(line[3..] + Environment.NewLine); continue; }
-                if (line.StartsWith("# "))   { rtb.SelectionFont = _mdH1; rtb.SelectionColor = Color.MediumSlateBlue; rtb.AppendText(line[2..] + Environment.NewLine); continue; }
+                if (line.StartsWith("###### ")) { rtb.SelectionFont = _mdBold;   rtb.SelectionColor = Color.SlateBlue;       rtb.AppendText(line[7..] + Environment.NewLine); continue; }
+                if (line.StartsWith("##### "))  { rtb.SelectionFont = _mdBold;   rtb.SelectionColor = Color.SlateBlue;       rtb.AppendText(line[6..] + Environment.NewLine); continue; }
+                if (line.StartsWith("#### "))   { rtb.SelectionFont = _mdH3;    rtb.SelectionColor = Color.SlateBlue;       rtb.AppendText(line[5..] + Environment.NewLine); continue; }
+                if (line.StartsWith("### "))    { rtb.SelectionFont = _mdH3;    rtb.SelectionColor = Color.MediumSlateBlue; rtb.AppendText(line[4..] + Environment.NewLine); continue; }
+                if (line.StartsWith("## "))     { rtb.SelectionFont = _mdH2;    rtb.SelectionColor = Color.MediumSlateBlue; rtb.AppendText(line[3..] + Environment.NewLine); continue; }
+                if (line.StartsWith("# "))      { rtb.SelectionFont = _mdH1;    rtb.SelectionColor = Color.MediumSlateBlue; rtb.AppendText(line[2..] + Environment.NewLine); continue; }
+
+                if (line.StartsWith("> ") || line == ">")
+                {
+                    string bqText = line.Length > 2 ? line[2..] : "";
+                    rtb.SelectionFont  = _mdItalic;
+                    rtb.SelectionColor = Color.DarkGray;
+                    rtb.AppendText("│ " + bqText + Environment.NewLine);
+                    continue;
+                }
 
                 string prefix = "";
                 string content = line;
@@ -453,6 +545,71 @@ namespace WindowsFormsApp
                 rtb.SelectionColor = SystemColors.WindowText;
                 rtb.AppendText(Environment.NewLine);
             }
+
+            FlushTable(); // flush any trailing table block
+        }
+
+        private void RenderMarkdownTable(RichTextBox rtb, List<string> lines)
+        {
+            // Parse rows, skip separator rows (|---|---|)
+            var rows = new List<string[]>();
+            foreach (var line in lines)
+            {
+                // Parse cells — handle rows with or without a trailing pipe
+                var parts = line.Split('|');
+                // Drop leading empty element (line starts with |)
+                if (parts.Length > 0 && parts[0].Trim().Length == 0)
+                    parts = parts.Skip(1).ToArray();
+                // Drop trailing empty element (line ends with |)
+                if (parts.Length > 0 && parts[^1].Trim().Length == 0)
+                    parts = parts.SkipLast(1).ToArray();
+                var cells = parts.Select(c => c.Trim()).ToArray();
+                if (cells.Length == 0) continue;
+                // Skip separator rows: |---|---|, |:---:|---|, etc.
+                if (cells.All(c => Regex.IsMatch(c, @"^[-:= ]+$"))) continue;
+                rows.Add(cells);
+            }
+            if (rows.Count == 0) return;
+
+            int cols     = rows.Max(r => r.Length);
+            var widths   = new int[cols];
+            foreach (var row in rows)
+                for (int i = 0; i < row.Length; i++)
+                    widths[i] = Math.Max(widths[i], row[i].Length);
+
+            for (int ri = 0; ri < rows.Count; ri++)
+            {
+                var row = rows[ri];
+                var sb  = new StringBuilder("  ");
+                for (int ci = 0; ci < cols; ci++)
+                {
+                    string cell = ci < row.Length ? row[ci] : "";
+                    sb.Append(cell.PadRight(widths[ci]));
+                    if (ci < cols - 1) sb.Append("  \u2502  ");
+                }
+
+                bool isHeader = (ri == 0);
+                rtb.SelectionFont  = isHeader ? _mdBold : _mdDefault;
+                rtb.SelectionColor = isHeader ? Color.MediumSlateBlue : SystemColors.WindowText;
+                rtb.AppendText(sb.ToString() + Environment.NewLine);
+
+                if (isHeader)
+                {
+                    var sep = new StringBuilder("  ");
+                    for (int ci = 0; ci < cols; ci++)
+                    {
+                        sep.Append(new string('\u2500', widths[ci]));
+                        if (ci < cols - 1) sep.Append("\u2500\u2500\u253c\u2500\u2500");
+                    }
+                    rtb.SelectionFont  = _mdDefault;
+                    rtb.SelectionColor = Color.DimGray;
+                    rtb.AppendText(sep.ToString() + Environment.NewLine);
+                }
+            }
+
+            rtb.SelectionFont  = _mdDefault;
+            rtb.SelectionColor = SystemColors.WindowText;
+            rtb.AppendText(Environment.NewLine);
         }
 
         private void AppendInlineMarkdown(RichTextBox rtb, string text)
@@ -495,10 +652,149 @@ namespace WindowsFormsApp
             return text.Length;
         }
 
+        // ── Export strip ─────────────────────────────────────────────────────────
+
+        private void SetupExportStrip()
+        {
+            var strip = new Panel
+            {
+                Dock      = DockStyle.Bottom,
+                Height    = 30,
+                BackColor = Color.FromArgb(28, 28, 28),
+            };
+
+            Button MkBtn(string text, int x, int w = 90) => new Button
+            {
+                Text      = text,
+                Location  = new Point(x, 3),
+                Size      = new Size(w, 24),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(45, 45, 48),
+                ForeColor = Color.White,
+                Font      = new Font("Segoe UI", 8.5f),
+                Cursor    = Cursors.Hand,
+            };
+
+            var btnCopy = MkBtn("📋 Copy",       4,   86);
+            var btnTxt  = MkBtn("💾 Save .txt",  94,  90);
+            var btnRtf  = MkBtn("📄 Save .rtf", 188,  90);
+            var btnCsv  = MkBtn("⊞ Export .csv",282, 100);
+
+            btnCopy.Click += (_, _) => ExportCopy();
+            btnTxt.Click  += (_, _) => ExportSaveTxt();
+            btnRtf.Click  += (_, _) => ExportSaveRtf();
+            btnCsv.Click  += (_, _) => ExportSaveCsv();
+
+            strip.Controls.AddRange(new Control[] { btnCopy, btnTxt, btnRtf, btnCsv });
+            Controls.Add(strip);
+            strip.BringToFront(); // dock above txtPrompt, below txtStream
+        }
+
+        private void ExportCopy()
+        {
+            if (string.IsNullOrEmpty(_lastCleanResponse)) return;
+            Clipboard.SetText(_lastCleanResponse, TextDataFormat.UnicodeText);
+        }
+
+        private void ExportSaveTxt()
+        {
+            if (string.IsNullOrEmpty(_lastCleanResponse)) return;
+            using var dlg = new SaveFileDialog
+            {
+                Title      = "Save response as plain text",
+                Filter     = "Text files (*.txt)|*.txt|All files (*.*)|*.*",
+                DefaultExt = "txt",
+                FileName   = $"IRIS_{DateTime.Now:yyyyMMdd_HHmm}",
+            };
+            if (dlg.ShowDialog() != DialogResult.OK) return;
+            File.WriteAllText(dlg.FileName, _lastCleanResponse, Encoding.UTF8);
+            OpenExportedFile(dlg.FileName);
+        }
+
+        private void ExportSaveRtf()
+        {
+            using var dlg = new SaveFileDialog
+            {
+                Title      = "Save session as RTF (Word-compatible)",
+                Filter     = "Rich Text Format (*.rtf)|*.rtf|All files (*.*)|*.*",
+                DefaultExt = "rtf",
+                FileName   = $"IRIS_{DateTime.Now:yyyyMMdd_HHmm}",
+            };
+            if (dlg.ShowDialog() != DialogResult.OK) return;
+            txtStream.SaveFile(dlg.FileName, RichTextBoxStreamType.RichText);
+            OpenExportedFile(dlg.FileName);
+        }
+
+        /// <summary>
+        /// CSV export: if the last response contains a markdown table, each row
+        /// becomes a CSV record. Otherwise the full text is exported as a single cell.
+        /// External callers (MemoryAdmin, Research Trace) can pass rows directly via
+        /// <see cref="ExportService.SaveCsv"/>.
+        /// </summary>
+        private void ExportSaveCsv()
+        {
+            var rows = ExtractTableRows(_lastCleanResponse);
+            if (rows == null)
+            {
+                if (string.IsNullOrEmpty(_lastCleanResponse)) return;
+                rows = new List<string[]> { new[] { _lastCleanResponse } };
+            }
+
+            using var dlg = new SaveFileDialog
+            {
+                Title      = "Export data as CSV",
+                Filter     = "CSV files (*.csv)|*.csv|All files (*.*)|*.*",
+                DefaultExt = "csv",
+                FileName   = $"IRIS_export_{DateTime.Now:yyyyMMdd_HHmm}",
+            };
+            if (dlg.ShowDialog() != DialogResult.OK) return;
+            using var sw = new StreamWriter(dlg.FileName, false, Encoding.UTF8);
+            foreach (var row in rows)
+                sw.WriteLine(string.Join(",", row.Select(c => $"\"{c.Replace("\"", "\"\"")}\" ")));
+            OpenExportedFile(dlg.FileName);
+        }
+
+        /// <summary>
+        /// Extracts all markdown table rows from clean text, skipping separator rows.
+        /// Returns null if no table is found. Intended for future reuse by Research
+        /// Trace and Memory Admin export buttons.
+        /// </summary>
+        internal static List<string[]>? ExtractTableRows(string? text)
+        {
+            if (string.IsNullOrEmpty(text)) return null;
+            var tableLines = text.Split('\n')
+                                 .Where(l => l.TrimStart().StartsWith("|") && l.Count(c => c == '|') >= 2)
+                                 .ToList();
+            if (tableLines.Count == 0) return null;
+
+            var rows = new List<string[]>();
+            foreach (var line in tableLines)
+            {
+                var cells = line.Split('|').Skip(1).SkipLast(1)
+                                .Select(c => c.Trim()).ToArray();
+                if (cells.All(c => Regex.IsMatch(c, @"^[-: ]+$"))) continue; // separator
+                rows.Add(cells);
+            }
+            return rows.Count > 0 ? rows : null;
+        }
+
+        private static void OpenExportedFile(string path)
+        {
+            try
+            {
+                System.Diagnostics.Process.Start(
+                    new System.Diagnostics.ProcessStartInfo(path) { UseShellExecute = true });
+            }
+            catch { /* best-effort; silently skip if no handler registered */ }
+        }
+
+        // ── Session reset ────────────────────────────────────────────────────────
+
         private void BtnNewSession_Click(object sender, EventArgs e)
         {
             _currentSessionId = Guid.NewGuid().ToString();
             _streamBuffer.Clear();
+            _lastCleanResponse = "";
             txtStream.Clear();
             txtStream.SelectionFont = _mdDefault;
             txtStream.SelectionColor = Color.DimGray;
