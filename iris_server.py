@@ -885,29 +885,46 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     if req.project_id:
         iris_memory.update_project_last_used(db, req.project_id)
 
+    t_context_start = time.monotonic()
     enriched_prompt, context_debug = _build_context(
         db, session_id, req.prompt, project_id=req.project_id
     )
+    context_ms = int((time.monotonic() - t_context_start) * 1000)
     _last_context_debug[session_id] = context_debug
 
     iris_memory.save_message(db, session_id, "user", req.prompt, model=req.model)
-    # Close the request-thread connection now — save_results() runs in a different
-    # thread (Starlette BackgroundTask) and must not reuse this connection.
     db.close()
 
     full_response: list[str] = []
-    start_time = time.time()
+    start_time = time.monotonic()
+    first_token_time: list[float | None] = [None]
+    token_count: list[int] = [0]
 
     def generate():
+        # Emit telemetry preamble (context build time; Ollama first-token measured inside)
+        # This line is intercepted by the client and never shown in the chat window.
+        yield f"\x01TLM:{{\"context_ms\":{context_ms}}}\n"
+
+        t_stream_start = time.monotonic()
         for token in _stream_ollama(enriched_prompt, req.model):
+            if first_token_time[0] is None:
+                first_token_time[0] = time.monotonic()
+                ollama_first_token_ms = int((first_token_time[0] - t_stream_start) * 1000)
+                # Patch the initial telemetry packet to include Ollama first-token latency.
+                # We emit a second packet rather than holding the first; client merges both.
+                yield f"\x01TLM:{{\"ollama_first_token_ms\":{ollama_first_token_ms}}}\n"
             full_response.append(token)
+            token_count[0] += 1
             yield token
 
+        # End-of-stream telemetry: tokens-per-second and total stats
+        elapsed = time.monotonic() - t_stream_start
+        tps = token_count[0] / elapsed if elapsed > 0 else 0.0
+        yield f"\x01END:{{\"total_tokens\":{token_count[0]},\"elapsed_ms\":{int(elapsed*1000)},\"tps\":{tps:.2f}}}\n"
+
     def save_results():
-        """Background task: runs in a Starlette thread-pool thread.
-        Opens its own SQLite connection — never reuses the request-thread connection."""
         response_text = "".join(full_response)
-        duration_ms = int((time.time() - start_time) * 1000)
+        duration_ms = int((time.monotonic() - start_time) * 1000)
         db2 = iris_memory.init_db(DB_PATH)
         try:
             assistant_msg_id = iris_memory.save_message(
@@ -1078,7 +1095,7 @@ async def _handle_research(req: ChatRequest) -> StreamingResponse:
                 "model":            req.model,
             }
             iris_memory.save_research_cache(
-                db, session_id, req.project_id or "", req.prompt, raw_result, candidates,
+                db, session_id, req.project_id or None, req.prompt, raw_result, candidates,
                 trace=trace, model=req.model,
             )
             db.close()

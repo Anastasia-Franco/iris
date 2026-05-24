@@ -108,7 +108,22 @@ namespace WindowsFormsApp
             // cmbModel
             // 
             cmbModel.FormattingEnabled = true;
-            cmbModel.Items.AddRange(new object[] { "llama3.3:latest", "qwen3:30b", "qwen3-coder-next:latest", "deepseek-coder-v2:lite", "qwen2.5-coder:1.5b", "deepseek-r1:32b" });
+            cmbModel.Items.AddRange(new object[] {
+                "qwen3:30b",
+                "qwen3-coder-next:latest",
+                "llama3.3:latest",
+                "llama3.1:8b",
+                "llama3.2:3b",
+                "llama3.2:1b",
+                "qwen2.5:7b",
+                "qwen2.5:14b",
+                "qwen2.5-coder:1.5b",
+                "mistral:7b",
+                "mixtral:8x7b",
+                "deepseek-r1:8b",
+                "deepseek-r1:32b",
+                "deepseek-coder-v2:lite",
+            });
             cmbModel.Location = new Point(565, 29);
             cmbModel.Name = "cmbModel";
             cmbModel.Size = new Size(169, 23);
@@ -156,7 +171,7 @@ namespace WindowsFormsApp
             pnlControls.Dock = DockStyle.Bottom;
             pnlControls.Location = new Point(0, 449);
             pnlControls.Name = "pnlControls";
-            pnlControls.Size = new Size(933, 70);
+            pnlControls.Size = new Size(933, 96);
             pnlControls.TabIndex = 4;
             // 
             // label2

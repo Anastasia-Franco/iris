@@ -28,12 +28,19 @@ def _now() -> str:
 # Database initialisation
 # ---------------------------------------------------------------------------
 
+# Tracks which DB paths have already been migrated in this process.
+# Prevents _migrate_scope_values() from issuing write-UPDATEs on every
+# connection open, which was the primary source of 'database is locked' races.
+_migrations_applied: set[str] = set()
+
+
 def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     """Create all tables, run schema migrations, seed defaults, return connection."""
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")   # wait up to 5 s instead of instant-fail on lock
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS projects (
@@ -168,9 +175,14 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
         );
     """)
     conn.commit()
-    _migrate_schema(conn)
-    _migrate_scope_values(conn)
-    _seed_default_projects(conn)
+    # Run schema migrations and seed data only once per process per DB path.
+    # Running them on every connection (including the ingestion worker's every-5s
+    # poll) caused continuous write-lock contention across threads.
+    if db_path not in _migrations_applied:
+        _migrate_schema(conn)
+        _migrate_scope_values(conn)
+        _seed_default_projects(conn)
+        _migrations_applied.add(db_path)
     return conn
 
 
